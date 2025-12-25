@@ -277,7 +277,13 @@ def main():
         (source_tree / 'out/Default').mkdir(parents=True)
         gn_flags = (_ROOT_DIR / 'ungoogled-chromium' / 'flags.gn').read_text(encoding=ENCODING)
         gn_flags += '\n'
-        windows_flags = (_ROOT_DIR / 'flags.windows.gn').read_text(encoding=ENCODING)
+        # Use local flags if present (gitignored), otherwise use tracked release flags
+        local_flags = _ROOT_DIR / 'flags.local.gn'
+        if local_flags.exists():
+            get_logger().info('Using local flags from flags.local.gn')
+            windows_flags = local_flags.read_text(encoding=ENCODING)
+        else:
+            windows_flags = (_ROOT_DIR / 'flags.windows.gn').read_text(encoding=ENCODING)
         if args.x86:
             windows_flags = windows_flags.replace('x64', 'x86')
         elif args.arm:
