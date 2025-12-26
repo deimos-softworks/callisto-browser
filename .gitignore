@@ -1,2 +1,3 @@
 /build
 flags.local.gn
+.gcs_entries
