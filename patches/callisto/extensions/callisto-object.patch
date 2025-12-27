@@ -1,5 +1,3 @@
-diff --git a/extensions/renderer/BUILD.gn b/extensions/renderer/BUILD.gn
-index 2488843beb..30b4497091 100644
 --- a/extensions/renderer/BUILD.gn
 +++ b/extensions/renderer/BUILD.gn
 @@ -102,6 +102,8 @@ source_set("renderer") {
@@ -11,9 +9,6 @@ index 2488843beb..30b4497091 100644
      "chrome_setting.cc",
      "chrome_setting.h",
      "console.cc",
-diff --git a/extensions/renderer/callisto_api.cc b/extensions/renderer/callisto_api.cc
-new file mode 100644
-index 0000000000..a1b2c3d4e5
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
 @@ -0,0 +1,393 @@
@@ -410,9 +405,6 @@ index 0000000000..a1b2c3d4e5
 +}
 +
 +}  // namespace extensions
-diff --git a/extensions/renderer/callisto_api.h b/extensions/renderer/callisto_api.h
-new file mode 100644
-index 0000000000..b2c3d4e5f6
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.h
 @@ -0,0 +1,35 @@
@@ -451,8 +443,6 @@ index 0000000000..b2c3d4e5f6
 +}  // namespace extensions
 +
 +#endif  // EXTENSIONS_RENDERER_CALLISTO_API_H_
-diff --git a/extensions/renderer/native_extension_bindings_system.cc b/extensions/renderer/native_extension_bindings_system.cc
-index d407845881..950b05a12e 100644
 --- a/extensions/renderer/native_extension_bindings_system.cc
 +++ b/extensions/renderer/native_extension_bindings_system.cc
 @@ -42,6 +42,7 @@
@@ -463,11 +453,11 @@ index d407845881..950b05a12e 100644
  #include "extensions/renderer/extension_frame_helper.h"
  #include "extensions/renderer/extension_interaction_provider.h"
  #include "extensions/renderer/extension_js_runner.h"
-@@ -517,6 +518,7 @@ void NativeExtensionBindingsSystem::DidCreateScriptContext(
+@@ -517,6 +518,7 @@ void NativeExtensionBindingsSystem::DidC
    if (context->context_type() == mojom::ContextType::kContentScript) {
      SetScriptingParams(context);
      MainWorldPortal::CreateForContext(context);
 +    CallistoAPI::CreateForContext(context);
    }
  }
-
+ 

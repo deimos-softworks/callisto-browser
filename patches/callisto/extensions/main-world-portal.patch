@@ -1,5 +1,3 @@
-diff --git a/extensions/renderer/BUILD.gn b/extensions/renderer/BUILD.gn
-index 5dce52a17e..2488843beb 100644
 --- a/extensions/renderer/BUILD.gn
 +++ b/extensions/renderer/BUILD.gn
 @@ -157,6 +157,8 @@ source_set("renderer") {
@@ -11,9 +9,6 @@ index 5dce52a17e..2488843beb 100644
      "module_system.cc",
      "module_system.h",
      "native_extension_bindings_system.cc",
-diff --git a/extensions/renderer/main_world_portal.cc b/extensions/renderer/main_world_portal.cc
-new file mode 100644
-index 0000000000..0e5755ea59
 --- /dev/null
 +++ b/extensions/renderer/main_world_portal.cc
 @@ -0,0 +1,402 @@
@@ -419,9 +414,6 @@ index 0000000000..0e5755ea59
 +}
 +
 +}  // namespace extensions
-diff --git a/extensions/renderer/main_world_portal.h b/extensions/renderer/main_world_portal.h
-new file mode 100644
-index 0000000000..90579a3925
 --- /dev/null
 +++ b/extensions/renderer/main_world_portal.h
 @@ -0,0 +1,46 @@
@@ -471,8 +463,6 @@ index 0000000000..90579a3925
 +}  // namespace extensions
 +
 +#endif  // EXTENSIONS_RENDERER_MAIN_WORLD_PORTAL_H_
-diff --git a/extensions/renderer/native_extension_bindings_system.cc b/extensions/renderer/native_extension_bindings_system.cc
-index 1508c29019..d407845881 100644
 --- a/extensions/renderer/native_extension_bindings_system.cc
 +++ b/extensions/renderer/native_extension_bindings_system.cc
 @@ -47,6 +47,7 @@
@@ -483,7 +473,7 @@ index 1508c29019..d407845881 100644
  #include "extensions/renderer/module_system.h"
  #include "extensions/renderer/renderer_extension_registry.h"
  #include "extensions/renderer/renderer_frame_context_data.h"
-@@ -515,6 +516,7 @@ void NativeExtensionBindingsSystem::DidCreateScriptContext(
+@@ -515,6 +516,7 @@ void NativeExtensionBindingsSystem::DidC
    // since main world script contexts have a different mojom::ContextType type.
    if (context->context_type() == mojom::ContextType::kContentScript) {
      SetScriptingParams(context);
@@ -491,4 +481,3 @@ index 1508c29019..d407845881 100644
    }
  }
  
-
