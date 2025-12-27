@@ -1,0 +1,379 @@
+diff --git a/v8/include/v8-callisto.h b/v8/include/v8-callisto.h
+new file mode 100644
+index 00000000..a1b2c3d4
+--- /dev/null
++++ b/v8/include/v8-callisto.h
+@@ -0,0 +1,67 @@
++// Copyright 2024 the Callisto Browser authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef INCLUDE_V8_CALLISTO_H_
++#define INCLUDE_V8_CALLISTO_H_
++
++#include <vector>
++
++#include "v8-function.h"          // NOLINT(build/include_directory)
++#include "v8-local-handle.h"      // NOLINT(build/include_directory)
++#include "v8-object.h"            // NOLINT(build/include_directory)
++#include "v8-persistent-handle.h" // NOLINT(build/include_directory)
++#include "v8-proxy.h"             // NOLINT(build/include_directory)
++#include "v8config.h"             // NOLINT(build/include_directory)
++
++namespace v8 {
++
++class Context;
++class Isolate;
++
++namespace callisto {
++
++struct V8_EXPORT ScopeInfo {
++  enum Type {
++    kGlobal = 0,
++    kLocal,
++    kWith,
++    kClosure,
++    kCatch,
++    kBlock,
++    kScript,
++    kEval,
++    kModule
++  };
++
++  Type type;
++  Local<Object> object;
++  Local<Value> name;
++};
++
++V8_EXPORT void QueryObjects(Local<Context> context, Local<Object> prototype,
++                            std::vector<Global<Object>>* objects);
++
++V8_EXPORT bool GetFunctionScopes(Isolate* isolate, Local<Function> function,
++                                 std::vector<ScopeInfo>* scopes);
++
++V8_EXPORT MaybeLocal<Function> CloneFunction(Local<Context> context,
++                                             Local<Function> function);
++
++V8_EXPORT bool HookFunction(Local<Context> context, Local<Function> target,
++                            Local<Function> replacement);
++
++V8_EXPORT bool RestoreFunction(Local<Context> context, Local<Function> target);
++
++V8_EXPORT bool IsFunctionHooked(Local<Context> context, Local<Function> target);
++
++V8_EXPORT bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
++                               Local<Object> new_handler);
++
++V8_EXPORT void GetProxyInternals(Local<Proxy> proxy, Local<Value>* target,
++                                 Local<Value>* handler);
++
++}  // namespace callisto
++}  // namespace v8
++
++#endif  // INCLUDE_V8_CALLISTO_H_
+diff --git a/v8/src/api/api.cc b/v8/src/api/api.cc
+index 5a879e9f..a0385a67 100644
+--- a/v8/src/api/api.cc
++++ b/v8/src/api/api.cc
+@@ -10,6 +10,7 @@
+ #include <optional>
+ #include <sstream>
+ #include <string>
++#include <unordered_map>
+ #include <utility>  // For move
+ #include <vector>
+
+@@ -30,6 +31,7 @@
+ #include "include/v8-template.h"
+ #include "include/v8-unwinder-state.h"
+ #include "include/v8-util.h"
++#include "include/v8-callisto.h"
+ #include "include/v8-wasm.h"
+ #include "src/api/api-arguments.h"
+ #include "src/api/api-inl.h"
+@@ -54,6 +56,8 @@
+ #include "src/compiler-dispatcher/lazy-compile-dispatcher.h"
+ #include "src/date/date.h"
+ #include "src/debug/debug.h"
++#include "src/debug/debug-interface.h"
++#include "src/debug/debug-scope-iterator.h"
+ #include "src/deoptimizer/deoptimizer.h"
+ #include "src/execution/embedder-state.h"
+ #include "src/execution/execution.h"
+@@ -92,13 +96,17 @@
+ #include "src/objects/embedder-data-slot-inl.h"
+ #include "src/objects/hash-table-inl.h"
+ #include "src/objects/heap-object.h"
++#include "src/objects/heap-object-inl.h"
+ #include "src/objects/instance-type-inl.h"
+ #include "src/objects/instance-type.h"
+ #include "src/objects/js-array-buffer-inl.h"
+ #include "src/objects/js-array-inl.h"
+ #include "src/objects/js-collection-inl.h"
+ #include "src/objects/js-objects.h"
++#include "src/objects/js-function-inl.h"
++#include "src/objects/js-proxy-inl.h"
+ #include "src/objects/js-promise-inl.h"
++#include "src/objects/shared-function-info-inl.h"
+ #include "src/objects/js-regexp-inl.h"
+ #include "src/objects/js-weak-refs-inl.h"
+ #include "src/objects/module-inl.h"
+@@ -12437,6 +12445,258 @@ TryToCopyAndConvertArrayToCppBuffer<CTypeInfoBuilder<double>::Build().GetId(),
+                                                             max_length);
+ }
+ 
++#ifdef GetObject
++#undef GetObject
++#endif
++
++namespace callisto {
++
++static std::unordered_map<int, i::Address>& GetHookedFunctions() {
++  static std::unordered_map<int, i::Address> hooked_functions;
++  return hooked_functions;
++}
++
++void QueryObjects(Local<Context> context, Local<Object> prototype,
++                  std::vector<Global<Object>>* objects) {
++  Isolate* v8_isolate = reinterpret_cast<Isolate*>(i::Isolate::Current());
++
++  class PrototypePredicate : public QueryObjectPredicate {
++   public:
++    explicit PrototypePredicate(Local<Object> proto) : prototype_(proto) {}
++    bool Filter(Local<Object> object) override {
++      Local<Value> proto = object;
++      for (int i = 0; i < 1000; ++i) {
++        Local<Value> next_proto = proto.As<Object>()->GetPrototypeV2();
++        if (next_proto.IsEmpty()) break;
++        proto = next_proto;
++        if (proto->IsNull() || proto->IsUndefined()) break;
++        if (proto->StrictEquals(prototype_)) return true;
++      }
++      return false;
++    }
++
++   private:
++    Local<Object> prototype_;
++  };
++
++  PrototypePredicate predicate(prototype);
++  v8_isolate->GetHeapProfiler()->QueryObjects(context, &predicate, objects);
++}
++
++bool GetFunctionScopes(Isolate* isolate, Local<Function> function,
++                       std::vector<ScopeInfo>* scopes) {
++  auto scope_iterator =
++      debug::ScopeIterator::CreateForFunction(isolate, function);
++  if (!scope_iterator) return false;
++
++  while (!scope_iterator->Done()) {
++    ScopeInfo info;
++    switch (scope_iterator->GetType()) {
++      case debug::ScopeIterator::ScopeTypeGlobal:
++        info.type = ScopeInfo::kGlobal;
++        break;
++      case debug::ScopeIterator::ScopeTypeLocal:
++        info.type = ScopeInfo::kLocal;
++        break;
++      case debug::ScopeIterator::ScopeTypeWith:
++        info.type = ScopeInfo::kWith;
++        break;
++      case debug::ScopeIterator::ScopeTypeClosure:
++        info.type = ScopeInfo::kClosure;
++        break;
++      case debug::ScopeIterator::ScopeTypeCatch:
++        info.type = ScopeInfo::kCatch;
++        break;
++      case debug::ScopeIterator::ScopeTypeBlock:
++        info.type = ScopeInfo::kBlock;
++        break;
++      case debug::ScopeIterator::ScopeTypeScript:
++        info.type = ScopeInfo::kScript;
++        break;
++      case debug::ScopeIterator::ScopeTypeEval:
++        info.type = ScopeInfo::kEval;
++        break;
++      case debug::ScopeIterator::ScopeTypeModule:
++        info.type = ScopeInfo::kModule;
++        break;
++      default:
++        info.type = ScopeInfo::kLocal;
++        break;
++    }
++    info.object = scope_iterator->GetObject();
++    info.name = scope_iterator->GetFunctionDebugName();
++    scopes->push_back(info);
++    scope_iterator->Advance();
++  }
++  return true;
++}
++
++MaybeLocal<Function> CloneFunction(Local<Context> context,
++                                   Local<Function> function) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
++
++  auto i_function = Utils::OpenDirectHandle(*function);
++  if (!i::IsJSFunction(*i_function)) return MaybeLocal<Function>();
++
++  auto js_function = i::Cast<i::JSFunction>(i_function);
++  i::DirectHandle<i::SharedFunctionInfo> shared =
++      i::direct_handle(js_function->shared(), i_isolate);
++  i::DirectHandle<i::Context> func_context =
++      i::direct_handle(js_function->context(), i_isolate);
++  i::Handle<i::JSFunction> new_function =
++      i::Factory::JSFunctionBuilder(i_isolate, shared, func_context).Build();
++
++  return Utils::ToLocal(new_function);
++}
++
++bool HookFunction(Local<Context> context, Local<Function> target,
++                  Local<Function> replacement) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_target = Utils::OpenDirectHandle(*target);
++  auto i_replacement = Utils::OpenDirectHandle(*replacement);
++
++  if (!i::IsJSFunction(*i_target) || !i::IsJSFunction(*i_replacement)) {
++    return false;
++  }
++
++  i::DirectHandle<i::JSFunction> target_handle = i::Cast<i::JSFunction>(i_target);
++  i::DirectHandle<i::JSFunction> replacement_handle = i::Cast<i::JSFunction>(i_replacement);
++
++  i::IsCompiledScope target_compiled_scope;
++  if (!target_handle->shared()->HasBytecodeArray()) {
++    if (!i::Compiler::Compile(i_isolate, target_handle,
++                              i::Compiler::CLEAR_EXCEPTION,
++                              &target_compiled_scope)) {
++      return false;
++    }
++  }
++
++  i::IsCompiledScope replacement_compiled_scope;
++  if (!replacement_handle->shared()->HasBytecodeArray()) {
++    if (!i::Compiler::Compile(i_isolate, replacement_handle,
++                              i::Compiler::CLEAR_EXCEPTION,
++                              &replacement_compiled_scope)) {
++      return false;
++    }
++  }
++
++  i::Tagged<i::JSFunction> target_func = *target_handle;
++  i::Tagged<i::JSFunction> replacement_func = *replacement_handle;
++
++  i::Tagged<i::SharedFunctionInfo> target_sfi = target_func->shared();
++  i::Tagged<i::SharedFunctionInfo> replacement_sfi = replacement_func->shared();
++
++  i::Deoptimizer::DeoptimizeFunction(target_func,
++                                     i::LazyDeoptimizeReason::kDebugger);
++  i::Deoptimizer::DeoptimizeFunction(replacement_func,
++                                     i::LazyDeoptimizeReason::kDebugger);
++
++  int identity_hash = target_func->GetOrCreateIdentityHash(i_isolate).value();
++  auto& hooked = GetHookedFunctions();
++
++  i::Tagged<i::BytecodeArray> target_bytecode =
++      target_sfi->GetBytecodeArray(i_isolate);
++  i::Tagged<i::BytecodeArray> replacement_bytecode =
++      replacement_sfi->GetBytecodeArray(i_isolate);
++
++  if (hooked.find(identity_hash) == hooked.end()) {
++    hooked[identity_hash] = target_bytecode.ptr();
++  }
++
++  if (target_sfi->HasBaselineCode()) {
++    target_sfi->FlushBaselineCode();
++  }
++
++  target_sfi->SetActiveBytecodeArray(replacement_bytecode, i_isolate);
++  target_func->UpdateCode(i_isolate,
++      *BUILTIN_CODE(i_isolate, InterpreterEntryTrampoline));
++
++  i::Deoptimizer::DeoptimizeFunction(target_func,
++                                     i::LazyDeoptimizeReason::kDebugger);
++
++  return true;
++}
++
++bool RestoreFunction(Local<Context> context, Local<Function> target) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_target = Utils::OpenDirectHandle(*target);
++  if (!i::IsJSFunction(*i_target)) return false;
++
++  i::Tagged<i::JSFunction> target_func = *i::Cast<i::JSFunction>(i_target);
++  int identity_hash = target_func->GetOrCreateIdentityHash(i_isolate).value();
++
++  auto& hooked = GetHookedFunctions();
++  auto it = hooked.find(identity_hash);
++  if (it == hooked.end()) return false;
++
++  i::Tagged<i::SharedFunctionInfo> target_sfi = target_func->shared();
++
++  i::Deoptimizer::DeoptimizeFunction(target_func,
++                                     i::LazyDeoptimizeReason::kDebugger);
++
++  if (target_sfi->HasBaselineCode()) {
++    target_sfi->FlushBaselineCode();
++  }
++
++  i::Tagged<i::BytecodeArray> original_bytecode =
++      i::TrustedCast<i::BytecodeArray>(
++          i::Tagged<i::Object>(i::Address(it->second)));
++  target_sfi->SetActiveBytecodeArray(original_bytecode, i_isolate);
++
++  target_func->UpdateCode(i_isolate,
++      *BUILTIN_CODE(i_isolate, InterpreterEntryTrampoline));
++
++  i::Deoptimizer::DeoptimizeFunction(target_func,
++                                     i::LazyDeoptimizeReason::kDebugger);
++
++  hooked.erase(it);
++
++  return true;
++}
++
++bool IsFunctionHooked(Local<Context> context, Local<Function> target) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_target = Utils::OpenDirectHandle(*target);
++  if (!i::IsJSFunction(*i_target)) return false;
++
++  i::Tagged<i::JSFunction> target_func = *i::Cast<i::JSFunction>(i_target);
++  int identity_hash = target_func->GetOrCreateIdentityHash(i_isolate).value();
++
++  auto& hooked = GetHookedFunctions();
++  return hooked.find(identity_hash) != hooked.end();
++}
++
++bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
++                     Local<Object> new_handler) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
++
++  auto i_proxy = Utils::OpenDirectHandle(*proxy);
++  auto i_handler = Utils::OpenDirectHandle(*new_handler);
++
++  if (!i::IsJSProxy(*i_proxy) || !i::IsJSReceiver(*i_handler)) {
++    return false;
++  }
++
++  auto js_proxy = i::Cast<i::JSProxy>(i_proxy);
++  auto js_handler = i::Cast<i::JSReceiver>(i_handler);
++
++  js_proxy->set_handler(*js_handler);
++
++  return true;
++}
++
++void GetProxyInternals(Local<Proxy> proxy, Local<Value>* target,
++                       Local<Value>* handler) {
++  *target = proxy->GetTarget();
++  *handler = proxy->GetHandler();
++}
++
++}  // namespace callisto
+ }  // namespace v8
+ 
+ #ifdef ENABLE_SLOW_DCHECKS

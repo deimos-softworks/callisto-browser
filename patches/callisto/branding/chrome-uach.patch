@@ -12,3 +12,4 @@ diff --git a/components/embedder_support/user_agent_utils.cc b/components/embedd
 
    std::string brand_version =
        output_version_type == blink::UserAgentBrandVersionType::kFullVersion
+
