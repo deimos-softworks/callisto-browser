@@ -113,7 +113,7 @@
  #include "src/objects/js-regexp-inl.h"
  #include "src/objects/js-weak-refs-inl.h"
  #include "src/objects/module-inl.h"
-@@ -12437,6 +12445,267 @@ TryToCopyAndConvertArrayToCppBuffer<CTyp
+@@ -12437,6 +12445,269 @@ TryToCopyAndConvertArrayToCppBuffer<CTyp
                                                              max_length);
  }
  
@@ -140,8 +140,10 @@
 +    bool Filter(Local<Object> object) override {
 +      if (object->IsModuleNamespaceObject()) return false;
 +
++      if (object->IsApiWrapper()) return false;
++
 +      Local<Context> objectContext;
-+      if (!object->GetCreationContext().ToLocal(&objectContext)) {
++      if (!debug::GetCreationContext(object).ToLocal(&objectContext)) {
 +        return false;
 +      }
 +
