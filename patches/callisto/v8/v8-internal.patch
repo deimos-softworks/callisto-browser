@@ -1,167 +1,46 @@
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -5521,6 +5521,7 @@ v8_source_set("v8_base_without_compiler"
+   sources = [
+     ### gcmole(all) ###
+     "src/api/api-arguments.cc",
++    "src/api/api-callisto.cc",
+     "src/api/api-natives.cc",
+     "src/api/api.cc",
+     "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
-+++ b/v8/include/v8-callisto.h
-@@ -0,0 +1,104 @@
-+// Copyright 2024 the Callisto Browser authors. All rights reserved.
-+// Use of this source code is governed by a BSD-style license that can be
-+// found in the LICENSE file.
++++ b/v8/src/api/api-callisto.cc
+@@ -0,0 +1,1067 @@
++// Internal implementation of Callisto API's
 +
-+#ifndef INCLUDE_V8_CALLISTO_H_
-+#define INCLUDE_V8_CALLISTO_H_
++#include "include/v8-callisto.h"
 +
++#include <string>
++#include <unordered_map>
 +#include <vector>
 +
-+#include "v8-array-buffer.h"      // NOLINT(build/include_directory)
-+#include "v8-function.h"          // NOLINT(build/include_directory)
-+#include "v8-local-handle.h"      // NOLINT(build/include_directory)
-+#include "v8-object.h"            // NOLINT(build/include_directory)
-+#include "v8-persistent-handle.h" // NOLINT(build/include_directory)
-+#include "v8-proxy.h"             // NOLINT(build/include_directory)
-+#include "v8config.h"             // NOLINT(build/include_directory)
-+
-+namespace v8 {
-+
-+class Context;
-+class Isolate;
-+
-+namespace callisto {
-+
-+struct V8_EXPORT ScopeInfo {
-+  enum Type {
-+    kGlobal = 0,
-+    kLocal,
-+    kWith,
-+    kClosure,
-+    kCatch,
-+    kBlock,
-+    kScript,
-+    kEval,
-+    kModule
-+  };
-+
-+  Type type;
-+  Local<Object> object;
-+  Local<Value> name;
-+};
-+
-+enum class V8_EXPORT FunctionStatus {
-+  kOk,
-+  kNotFunction,
-+  kBuiltinFunction,
-+  kNativeFunction,
-+  kBoundFunction,
-+  kApiFunction,
-+  kWasmFunction,
-+  kNotCompiled,
-+  kNoBytecode,
-+  kKindMismatch,
-+};
-+
-+V8_EXPORT FunctionStatus ValidateFunction(Local<Context> context,
-+                                          Local<Function> function);
-+
-+V8_EXPORT FunctionStatus ValidateFunctionPair(Local<Context> context,
-+                                              Local<Function> target,
-+                                              Local<Function> replacement);
-+
-+V8_EXPORT void QueryObjects(Local<Context> context, Local<Object> prototype,
-+                            std::vector<Global<Object>>* objects);
-+
-+V8_EXPORT bool GetFunctionScopes(Isolate* isolate, Local<Function> function,
-+                                 std::vector<ScopeInfo>* scopes);
-+
-+V8_EXPORT MaybeLocal<Function> CloneFunction(Local<Context> context,
-+                                             Local<Function> function);
-+
-+V8_EXPORT MaybeLocal<Object> DumpFunction(Local<Context> context,
-+                                          Local<Function> function);
-+
-+V8_EXPORT MaybeLocal<Function> BuildFunction(Local<Context> context,
-+                                             Local<Object> data,
-+                                             Local<Function> template_func = Local<Function>());
-+
-+V8_EXPORT bool HookFunction(Local<Context> context, Local<Function> target,
-+                            Local<Function> replacement);
-+
-+V8_EXPORT bool RestoreFunction(Local<Context> context, Local<Function> target);
-+
-+V8_EXPORT bool IsFunctionHooked(Local<Context> context, Local<Function> target);
-+
-+V8_EXPORT bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
-+                               Local<Object> new_handler);
-+
-+V8_EXPORT void GetProxyInternals(Local<Proxy> proxy, Local<Value>* target,
-+                                 Local<Value>* handler);
-+
-+V8_EXPORT bool UnfreezeObject(Local<Context> context, Local<Object> object);
-+
-+V8_EXPORT bool UnsealObject(Local<Context> context, Local<Object> object);
-+
-+V8_EXPORT bool MakeExtensible(Local<Context> context, Local<Object> object);
-+
-+V8_EXPORT bool OverwriteProperty(Local<Context> context, Local<Object> object,
-+                                 Local<Name> key, Local<Value> value,
-+                                 PropertyAttribute attributes);
-+}  // namespace callisto
-+}  // namespace v8
-+
-+#endif  // INCLUDE_V8_CALLISTO_H_
---- a/v8/src/api/api.cc
-+++ b/v8/src/api/api.cc
-@@ -10,6 +10,7 @@
- #include <optional>
- #include <sstream>
- #include <string>
-+#include <unordered_map>
- #include <utility>  // For move
- #include <vector>
- 
-@@ -30,6 +31,7 @@
- #include "include/v8-template.h"
- #include "include/v8-unwinder-state.h"
- #include "include/v8-util.h"
-+#include "include/v8-callisto.h"
- #include "include/v8-wasm.h"
- #include "src/api/api-arguments.h"
- #include "src/api/api-inl.h"
-@@ -54,6 +56,8 @@
- #include "src/compiler-dispatcher/lazy-compile-dispatcher.h"
- #include "src/date/date.h"
- #include "src/debug/debug.h"
++#include "include/v8-profiler.h"
++#include "src/api/api-inl.h"
++#include "src/builtins/builtins.h"
++#include "src/codegen/compiler.h"
 +#include "src/debug/debug-interface.h"
 +#include "src/debug/debug-scope-iterator.h"
- #include "src/deoptimizer/deoptimizer.h"
- #include "src/execution/embedder-state.h"
- #include "src/execution/execution.h"
-@@ -92,13 +96,17 @@
- #include "src/objects/embedder-data-slot-inl.h"
- #include "src/objects/hash-table-inl.h"
- #include "src/objects/heap-object.h"
++#include "src/deoptimizer/deoptimizer.h"
++#include "src/interpreter/bytecode-array-iterator.h"
++#include "src/interpreter/interpreter.h"
 +#include "src/objects/heap-object-inl.h"
- #include "src/objects/instance-type-inl.h"
- #include "src/objects/instance-type.h"
- #include "src/objects/js-array-buffer-inl.h"
- #include "src/objects/js-array-inl.h"
- #include "src/objects/js-collection-inl.h"
- #include "src/objects/js-objects.h"
 +#include "src/objects/js-function-inl.h"
 +#include "src/objects/js-proxy-inl.h"
- #include "src/objects/js-promise-inl.h"
 +#include "src/objects/shared-function-info-inl.h"
- #include "src/objects/js-regexp-inl.h"
- #include "src/objects/js-weak-refs-inl.h"
- #include "src/objects/module-inl.h"
-@@ -12437,8 +12445,1044 @@ TryToCopyAndConvertArrayToCppBuffer<CTyp
-                                                             max_length);
- }
- 
--}  // namespace v8
++
 +#ifdef GetObject
 +#undef GetObject
 +#endif
- 
--#ifdef ENABLE_SLOW_DCHECKS
--EXPORT_CONTEXTUAL_VARIABLE(i::StackAllocatedCheck)
++
++namespace v8 {
 +namespace callisto {
++
++// Internal state and helpers
 +
 +static std::unordered_map<int, i::Address>& GetHookedFunctions() {
 +  static std::unordered_map<int, i::Address> hooked_functions;
@@ -210,7 +89,7 @@
 +      sfi->HasAsmWasmData()) {
 +    return FunctionValidationResult::kWasmFunction;
 +  }
- #endif
++#endif
 +
 +  if (!sfi->is_compiled()) {
 +    return FunctionValidationResult::kNotCompiled;
@@ -285,6 +164,85 @@
 +  }
 +  return FunctionStatus::kNotFunction;
 +}
++
++static Local<ArrayBuffer> ByteArrayToArrayBuffer(i::Isolate* isolate,
++                                                  const uint8_t* data,
++                                                  size_t length) {
++  Local<ArrayBuffer> buffer = ArrayBuffer::New(
++      reinterpret_cast<Isolate*>(isolate), length);
++  if (length > 0) {
++    memcpy(buffer->GetBackingStore()->Data(), data, length);
++  }
++  return buffer;
++}
++
++static Local<ArrayBuffer> TrustedByteArrayToBuffer(i::Isolate* isolate,
++                                                   i::Tagged<i::TrustedByteArray> arr) {
++  if (arr.is_null() || arr->length() == 0) {
++    return ArrayBuffer::New(reinterpret_cast<Isolate*>(isolate), 0);
++  }
++  return ByteArrayToArrayBuffer(isolate, arr->begin(), arr->length());
++}
++
++static const char* FunctionKindToString(i::FunctionKind kind) {
++  switch (kind) {
++    case i::FunctionKind::kNormalFunction: return "normal";
++    case i::FunctionKind::kArrowFunction: return "arrow";
++    case i::FunctionKind::kGeneratorFunction: return "generator";
++    case i::FunctionKind::kAsyncFunction: return "async";
++    case i::FunctionKind::kAsyncArrowFunction: return "asyncArrow";
++    case i::FunctionKind::kAsyncGeneratorFunction: return "asyncGenerator";
++    case i::FunctionKind::kConciseMethod: return "method";
++    case i::FunctionKind::kStaticConciseMethod: return "staticMethod";
++    case i::FunctionKind::kConciseGeneratorMethod: return "generatorMethod";
++    case i::FunctionKind::kStaticConciseGeneratorMethod: return "staticGeneratorMethod";
++    case i::FunctionKind::kAsyncConciseMethod: return "asyncMethod";
++    case i::FunctionKind::kStaticAsyncConciseMethod: return "staticAsyncMethod";
++    case i::FunctionKind::kAsyncConciseGeneratorMethod: return "asyncGeneratorMethod";
++    case i::FunctionKind::kStaticAsyncConciseGeneratorMethod: return "staticAsyncGeneratorMethod";
++    case i::FunctionKind::kGetterFunction: return "getter";
++    case i::FunctionKind::kStaticGetterFunction: return "staticGetter";
++    case i::FunctionKind::kSetterFunction: return "setter";
++    case i::FunctionKind::kStaticSetterFunction: return "staticSetter";
++    case i::FunctionKind::kClassMembersInitializerFunction: return "classInitializer";
++    case i::FunctionKind::kClassStaticInitializerFunction: return "staticInitializer";
++    case i::FunctionKind::kBaseConstructor: return "baseConstructor";
++    case i::FunctionKind::kDefaultBaseConstructor: return "defaultBaseConstructor";
++    case i::FunctionKind::kDerivedConstructor: return "derivedConstructor";
++    case i::FunctionKind::kDefaultDerivedConstructor: return "defaultDerivedConstructor";
++    default: return "unknown";
++  }
++}
++
++static i::FunctionKind StringToFunctionKind(const std::string& str) {
++  if (str == "normal") return i::FunctionKind::kNormalFunction;
++  if (str == "arrow") return i::FunctionKind::kArrowFunction;
++  if (str == "generator") return i::FunctionKind::kGeneratorFunction;
++  if (str == "async") return i::FunctionKind::kAsyncFunction;
++  if (str == "asyncArrow") return i::FunctionKind::kAsyncArrowFunction;
++  if (str == "asyncGenerator") return i::FunctionKind::kAsyncGeneratorFunction;
++  if (str == "method") return i::FunctionKind::kConciseMethod;
++  if (str == "staticMethod") return i::FunctionKind::kStaticConciseMethod;
++  if (str == "generatorMethod") return i::FunctionKind::kConciseGeneratorMethod;
++  if (str == "staticGeneratorMethod") return i::FunctionKind::kStaticConciseGeneratorMethod;
++  if (str == "asyncMethod") return i::FunctionKind::kAsyncConciseMethod;
++  if (str == "staticAsyncMethod") return i::FunctionKind::kStaticAsyncConciseMethod;
++  if (str == "asyncGeneratorMethod") return i::FunctionKind::kAsyncConciseGeneratorMethod;
++  if (str == "staticAsyncGeneratorMethod") return i::FunctionKind::kStaticAsyncConciseGeneratorMethod;
++  if (str == "getter") return i::FunctionKind::kGetterFunction;
++  if (str == "staticGetter") return i::FunctionKind::kStaticGetterFunction;
++  if (str == "setter") return i::FunctionKind::kSetterFunction;
++  if (str == "staticSetter") return i::FunctionKind::kStaticSetterFunction;
++  if (str == "classInitializer") return i::FunctionKind::kClassMembersInitializerFunction;
++  if (str == "staticInitializer") return i::FunctionKind::kClassStaticInitializerFunction;
++  if (str == "baseConstructor") return i::FunctionKind::kBaseConstructor;
++  if (str == "defaultBaseConstructor") return i::FunctionKind::kDefaultBaseConstructor;
++  if (str == "derivedConstructor") return i::FunctionKind::kDerivedConstructor;
++  if (str == "defaultDerivedConstructor") return i::FunctionKind::kDefaultDerivedConstructor;
++  return i::FunctionKind::kNormalFunction;
++}
++
++// Public API implementations
 +
 +FunctionStatus ValidateFunction(Local<Context> context,
 +                                Local<Function> function) {
@@ -481,83 +439,6 @@
 +  new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
 +
 +  return Utils::ToLocal(new_func);
-+}
-+
-+static Local<ArrayBuffer> ByteArrayToArrayBuffer(i::Isolate* isolate,
-+                                                  const uint8_t* data,
-+                                                  size_t length) {
-+  Local<ArrayBuffer> buffer = ArrayBuffer::New(
-+      reinterpret_cast<Isolate*>(isolate), length);
-+  if (length > 0) {
-+    memcpy(buffer->GetBackingStore()->Data(), data, length);
-+  }
-+  return buffer;
-+}
-+
-+static Local<ArrayBuffer> TrustedByteArrayToBuffer(i::Isolate* isolate,
-+                                                   i::Tagged<i::TrustedByteArray> arr) {
-+  if (arr.is_null() || arr->length() == 0) {
-+    return ArrayBuffer::New(reinterpret_cast<Isolate*>(isolate), 0);
-+  }
-+  return ByteArrayToArrayBuffer(isolate, arr->begin(), arr->length());
-+}
-+
-+static const char* FunctionKindToString(i::FunctionKind kind) {
-+  switch (kind) {
-+    case i::FunctionKind::kNormalFunction: return "normal";
-+    case i::FunctionKind::kArrowFunction: return "arrow";
-+    case i::FunctionKind::kGeneratorFunction: return "generator";
-+    case i::FunctionKind::kAsyncFunction: return "async";
-+    case i::FunctionKind::kAsyncArrowFunction: return "asyncArrow";
-+    case i::FunctionKind::kAsyncGeneratorFunction: return "asyncGenerator";
-+    case i::FunctionKind::kConciseMethod: return "method";
-+    case i::FunctionKind::kStaticConciseMethod: return "staticMethod";
-+    case i::FunctionKind::kConciseGeneratorMethod: return "generatorMethod";
-+    case i::FunctionKind::kStaticConciseGeneratorMethod: return "staticGeneratorMethod";
-+    case i::FunctionKind::kAsyncConciseMethod: return "asyncMethod";
-+    case i::FunctionKind::kStaticAsyncConciseMethod: return "staticAsyncMethod";
-+    case i::FunctionKind::kAsyncConciseGeneratorMethod: return "asyncGeneratorMethod";
-+    case i::FunctionKind::kStaticAsyncConciseGeneratorMethod: return "staticAsyncGeneratorMethod";
-+    case i::FunctionKind::kGetterFunction: return "getter";
-+    case i::FunctionKind::kStaticGetterFunction: return "staticGetter";
-+    case i::FunctionKind::kSetterFunction: return "setter";
-+    case i::FunctionKind::kStaticSetterFunction: return "staticSetter";
-+    case i::FunctionKind::kClassMembersInitializerFunction: return "classInitializer";
-+    case i::FunctionKind::kClassStaticInitializerFunction: return "staticInitializer";
-+    case i::FunctionKind::kBaseConstructor: return "baseConstructor";
-+    case i::FunctionKind::kDefaultBaseConstructor: return "defaultBaseConstructor";
-+    case i::FunctionKind::kDerivedConstructor: return "derivedConstructor";
-+    case i::FunctionKind::kDefaultDerivedConstructor: return "defaultDerivedConstructor";
-+    default: return "unknown";
-+  }
-+}
-+
-+static i::FunctionKind StringToFunctionKind(const std::string& str) {
-+  if (str == "normal") return i::FunctionKind::kNormalFunction;
-+  if (str == "arrow") return i::FunctionKind::kArrowFunction;
-+  if (str == "generator") return i::FunctionKind::kGeneratorFunction;
-+  if (str == "async") return i::FunctionKind::kAsyncFunction;
-+  if (str == "asyncArrow") return i::FunctionKind::kAsyncArrowFunction;
-+  if (str == "asyncGenerator") return i::FunctionKind::kAsyncGeneratorFunction;
-+  if (str == "method") return i::FunctionKind::kConciseMethod;
-+  if (str == "staticMethod") return i::FunctionKind::kStaticConciseMethod;
-+  if (str == "generatorMethod") return i::FunctionKind::kConciseGeneratorMethod;
-+  if (str == "staticGeneratorMethod") return i::FunctionKind::kStaticConciseGeneratorMethod;
-+  if (str == "asyncMethod") return i::FunctionKind::kAsyncConciseMethod;
-+  if (str == "staticAsyncMethod") return i::FunctionKind::kStaticAsyncConciseMethod;
-+  if (str == "asyncGeneratorMethod") return i::FunctionKind::kAsyncConciseGeneratorMethod;
-+  if (str == "staticAsyncGeneratorMethod") return i::FunctionKind::kStaticAsyncConciseGeneratorMethod;
-+  if (str == "getter") return i::FunctionKind::kGetterFunction;
-+  if (str == "staticGetter") return i::FunctionKind::kStaticGetterFunction;
-+  if (str == "setter") return i::FunctionKind::kSetterFunction;
-+  if (str == "staticSetter") return i::FunctionKind::kStaticSetterFunction;
-+  if (str == "classInitializer") return i::FunctionKind::kClassMembersInitializerFunction;
-+  if (str == "staticInitializer") return i::FunctionKind::kClassStaticInitializerFunction;
-+  if (str == "baseConstructor") return i::FunctionKind::kBaseConstructor;
-+  if (str == "defaultBaseConstructor") return i::FunctionKind::kDefaultBaseConstructor;
-+  if (str == "derivedConstructor") return i::FunctionKind::kDerivedConstructor;
-+  if (str == "defaultDerivedConstructor") return i::FunctionKind::kDefaultDerivedConstructor;
-+  return i::FunctionKind::kNormalFunction;
 +}
 +
 +MaybeLocal<Object> DumpFunction(Local<Context> context,
@@ -953,7 +834,6 @@
 +bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
 +                      Local<Object> new_handler) {
 +  i::Isolate* i_isolate = i::Isolate::Current();
-+  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
 +
 +  auto i_proxy = Utils::OpenDirectHandle(*proxy);
 +  auto i_handler = Utils::OpenDirectHandle(*new_handler);

@@ -1,0 +1,107 @@
+--- /dev/null
++++ b/v8/include/v8-callisto.h
+@@ -0,0 +1,104 @@
++// Copyright 2024 the Callisto Browser authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef INCLUDE_V8_CALLISTO_H_
++#define INCLUDE_V8_CALLISTO_H_
++
++#include <vector>
++
++#include "v8-array-buffer.h"      // NOLINT(build/include_directory)
++#include "v8-function.h"          // NOLINT(build/include_directory)
++#include "v8-local-handle.h"      // NOLINT(build/include_directory)
++#include "v8-object.h"            // NOLINT(build/include_directory)
++#include "v8-persistent-handle.h" // NOLINT(build/include_directory)
++#include "v8-proxy.h"             // NOLINT(build/include_directory)
++#include "v8config.h"             // NOLINT(build/include_directory)
++
++namespace v8 {
++
++class Context;
++class Isolate;
++
++namespace callisto {
++
++struct V8_EXPORT ScopeInfo {
++  enum Type {
++    kGlobal = 0,
++    kLocal,
++    kWith,
++    kClosure,
++    kCatch,
++    kBlock,
++    kScript,
++    kEval,
++    kModule
++  };
++
++  Type type;
++  Local<Object> object;
++  Local<Value> name;
++};
++
++enum class V8_EXPORT FunctionStatus {
++  kOk,
++  kNotFunction,
++  kBuiltinFunction,
++  kNativeFunction,
++  kBoundFunction,
++  kApiFunction,
++  kWasmFunction,
++  kNotCompiled,
++  kNoBytecode,
++  kKindMismatch,
++};
++
++V8_EXPORT FunctionStatus ValidateFunction(Local<Context> context,
++                                          Local<Function> function);
++
++V8_EXPORT FunctionStatus ValidateFunctionPair(Local<Context> context,
++                                              Local<Function> target,
++                                              Local<Function> replacement);
++
++V8_EXPORT void QueryObjects(Local<Context> context, Local<Object> prototype,
++                            std::vector<Global<Object>>* objects);
++
++V8_EXPORT bool GetFunctionScopes(Isolate* isolate, Local<Function> function,
++                                 std::vector<ScopeInfo>* scopes);
++
++V8_EXPORT MaybeLocal<Function> CloneFunction(Local<Context> context,
++                                             Local<Function> function);
++
++V8_EXPORT MaybeLocal<Object> DumpFunction(Local<Context> context,
++                                          Local<Function> function);
++
++V8_EXPORT MaybeLocal<Function> BuildFunction(Local<Context> context,
++                                             Local<Object> data,
++                                             Local<Function> template_func = Local<Function>());
++
++V8_EXPORT bool HookFunction(Local<Context> context, Local<Function> target,
++                            Local<Function> replacement);
++
++V8_EXPORT bool RestoreFunction(Local<Context> context, Local<Function> target);
++
++V8_EXPORT bool IsFunctionHooked(Local<Context> context, Local<Function> target);
++
++V8_EXPORT bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
++                               Local<Object> new_handler);
++
++V8_EXPORT void GetProxyInternals(Local<Proxy> proxy, Local<Value>* target,
++                                 Local<Value>* handler);
++
++V8_EXPORT bool UnfreezeObject(Local<Context> context, Local<Object> object);
++
++V8_EXPORT bool UnsealObject(Local<Context> context, Local<Object> object);
++
++V8_EXPORT bool MakeExtensible(Local<Context> context, Local<Object> object);
++
++V8_EXPORT bool OverwriteProperty(Local<Context> context, Local<Object> object,
++                                 Local<Name> key, Local<Value> value,
++                                 PropertyAttribute attributes);
++}  // namespace callisto
++}  // namespace v8
++
++#endif  // INCLUDE_V8_CALLISTO_H_

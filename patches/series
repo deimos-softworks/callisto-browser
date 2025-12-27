@@ -21,7 +21,7 @@ ungoogled-chromium/windows/windows-fix-licenses-gn-path.patch
 ungoogled-chromium/windows/windows-fix-building-with-rust.patch
 ungoogled-chromium/windows/windows-fix-remove-unused-preferences-fields.patch
 ungoogled-chromium/windows/windows-fix-missing-includes.patch
-callisto/v8/api-internals.patch
-callisto/extensions/main-world-portal.patch
-callisto/extensions/callisto-object.patch
+callisto/v8/v8-public.patch
+callisto/v8/v8-internal.patch
+callisto/v8/extension-bindings.patch
 callisto/branding/chrome-uach.patch
