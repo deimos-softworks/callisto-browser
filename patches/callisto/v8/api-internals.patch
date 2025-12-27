@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/v8/include/v8-callisto.h
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,104 @@
 +// Copyright 2024 the Callisto Browser authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -10,6 +10,7 @@
 +
 +#include <vector>
 +
++#include "v8-array-buffer.h"      // NOLINT(build/include_directory)
 +#include "v8-function.h"          // NOLINT(build/include_directory)
 +#include "v8-local-handle.h"      // NOLINT(build/include_directory)
 +#include "v8-object.h"            // NOLINT(build/include_directory)
@@ -42,6 +43,26 @@
 +  Local<Value> name;
 +};
 +
++enum class V8_EXPORT FunctionStatus {
++  kOk,
++  kNotFunction,
++  kBuiltinFunction,
++  kNativeFunction,
++  kBoundFunction,
++  kApiFunction,
++  kWasmFunction,
++  kNotCompiled,
++  kNoBytecode,
++  kKindMismatch,
++};
++
++V8_EXPORT FunctionStatus ValidateFunction(Local<Context> context,
++                                          Local<Function> function);
++
++V8_EXPORT FunctionStatus ValidateFunctionPair(Local<Context> context,
++                                              Local<Function> target,
++                                              Local<Function> replacement);
++
 +V8_EXPORT void QueryObjects(Local<Context> context, Local<Object> prototype,
 +                            std::vector<Global<Object>>* objects);
 +
@@ -50,6 +71,13 @@
 +
 +V8_EXPORT MaybeLocal<Function> CloneFunction(Local<Context> context,
 +                                             Local<Function> function);
++
++V8_EXPORT MaybeLocal<Object> DumpFunction(Local<Context> context,
++                                          Local<Function> function);
++
++V8_EXPORT MaybeLocal<Function> BuildFunction(Local<Context> context,
++                                             Local<Object> data,
++                                             Local<Function> template_func = Local<Function>());
 +
 +V8_EXPORT bool HookFunction(Local<Context> context, Local<Function> target,
 +                            Local<Function> replacement);
@@ -64,6 +92,15 @@
 +V8_EXPORT void GetProxyInternals(Local<Proxy> proxy, Local<Value>* target,
 +                                 Local<Value>* handler);
 +
++V8_EXPORT bool UnfreezeObject(Local<Context> context, Local<Object> object);
++
++V8_EXPORT bool UnsealObject(Local<Context> context, Local<Object> object);
++
++V8_EXPORT bool MakeExtensible(Local<Context> context, Local<Object> object);
++
++V8_EXPORT bool OverwriteProperty(Local<Context> context, Local<Object> object,
++                                 Local<Name> key, Local<Value> value,
++                                 PropertyAttribute attributes);
 +}  // namespace callisto
 +}  // namespace v8
 +
@@ -113,14 +150,17 @@
  #include "src/objects/js-regexp-inl.h"
  #include "src/objects/js-weak-refs-inl.h"
  #include "src/objects/module-inl.h"
-@@ -12437,6 +12445,269 @@ TryToCopyAndConvertArrayToCppBuffer<CTyp
+@@ -12437,8 +12445,1044 @@ TryToCopyAndConvertArrayToCppBuffer<CTyp
                                                              max_length);
  }
  
+-}  // namespace v8
 +#ifdef GetObject
 +#undef GetObject
 +#endif
-+
+ 
+-#ifdef ENABLE_SLOW_DCHECKS
+-EXPORT_CONTEXTUAL_VARIABLE(i::StackAllocatedCheck)
 +namespace callisto {
 +
 +static std::unordered_map<int, i::Address>& GetHookedFunctions() {
@@ -128,12 +168,195 @@
 +  return hooked_functions;
 +}
 +
++enum class FunctionValidationResult {
++  kValid,
++  kNotJSFunction,
++  kBoundFunction,
++  kBuiltinFunction,
++  kNativeFunction,
++  kApiFunction,
++  kWasmFunction,
++  kNotCompiled,
++  kNoBytecode,
++  kNoScript,
++};
++
++static FunctionValidationResult ValidateFunctionForHooking(
++    i::Isolate* isolate,
++    i::DirectHandle<i::JSFunction> js_func) {
++  if (!i::IsJSFunction(*js_func)) {
++    return FunctionValidationResult::kNotJSFunction;
++  }
++
++  i::DirectHandle<i::SharedFunctionInfo> sfi(js_func->shared(), isolate);
++
++  if (sfi->HasBuiltinId()) {
++    return FunctionValidationResult::kBuiltinFunction;
++  }
++
++  if (sfi->native()) {
++    return FunctionValidationResult::kNativeFunction;
++  }
++
++  if (sfi->IsApiFunction()) {
++    return FunctionValidationResult::kApiFunction;
++  }
++
++#if V8_ENABLE_WEBASSEMBLY
++  if (sfi->HasWasmExportedFunctionData(isolate) ||
++      sfi->HasWasmJSFunctionData(isolate) ||
++      sfi->HasWasmCapiFunctionData(isolate) ||
++      sfi->HasWasmResumeData() ||
++      sfi->HasAsmWasmData()) {
++    return FunctionValidationResult::kWasmFunction;
++  }
+ #endif
++
++  if (!sfi->is_compiled()) {
++    return FunctionValidationResult::kNotCompiled;
++  }
++
++  if (sfi->HasUncompiledData(isolate)) {
++    return FunctionValidationResult::kNotCompiled;
++  }
++
++  if (!sfi->HasBytecodeArray()) {
++    return FunctionValidationResult::kNoBytecode;
++  }
++
++  return FunctionValidationResult::kValid;
++}
++
++static bool FunctionKindsCompatible(i::FunctionKind a, i::FunctionKind b) {
++  bool a_generator = i::IsGeneratorFunction(a) || i::IsAsyncGeneratorFunction(a);
++  bool b_generator = i::IsGeneratorFunction(b) || i::IsAsyncGeneratorFunction(b);
++  if (a_generator != b_generator) return false;
++
++  bool a_async = i::IsAsyncFunction(a) || i::IsAsyncGeneratorFunction(a);
++  bool b_async = i::IsAsyncFunction(b) || i::IsAsyncGeneratorFunction(b);
++  if (a_async != b_async) return false;
++
++  return true;
++}
++
++static bool EnsureFunctionCompiled(i::Isolate* isolate,
++                                   i::DirectHandle<i::JSFunction> js_func) {
++  i::DirectHandle<i::SharedFunctionInfo> sfi(js_func->shared(), isolate);
++
++  i::Deoptimizer::DeoptimizeFunction(*js_func, i::LazyDeoptimizeReason::kDebugger);
++
++  if (sfi->HasBaselineCode()) {
++    sfi->FlushBaselineCode();
++  }
++
++  if (!sfi->HasBytecodeArray()) {
++    i::IsCompiledScope compiled_scope(*sfi, isolate);
++    if (!i::Compiler::Compile(isolate, js_func,
++                              i::Compiler::CLEAR_EXCEPTION, &compiled_scope)) {
++      return false;
++    }
++  }
++
++  return sfi->HasBytecodeArray();
++}
++
++static FunctionStatus ToPublicStatus(FunctionValidationResult result) {
++  switch (result) {
++    case FunctionValidationResult::kValid:
++      return FunctionStatus::kOk;
++    case FunctionValidationResult::kNotJSFunction:
++      return FunctionStatus::kNotFunction;
++    case FunctionValidationResult::kBoundFunction:
++      return FunctionStatus::kBoundFunction;
++    case FunctionValidationResult::kBuiltinFunction:
++      return FunctionStatus::kBuiltinFunction;
++    case FunctionValidationResult::kNativeFunction:
++      return FunctionStatus::kNativeFunction;
++    case FunctionValidationResult::kApiFunction:
++      return FunctionStatus::kApiFunction;
++    case FunctionValidationResult::kWasmFunction:
++      return FunctionStatus::kWasmFunction;
++    case FunctionValidationResult::kNotCompiled:
++      return FunctionStatus::kNotCompiled;
++    case FunctionValidationResult::kNoBytecode:
++      return FunctionStatus::kNoBytecode;
++    case FunctionValidationResult::kNoScript:
++      return FunctionStatus::kNoBytecode;
++  }
++  return FunctionStatus::kNotFunction;
++}
++
++FunctionStatus ValidateFunction(Local<Context> context,
++                                Local<Function> function) {
++  i::Isolate* isolate = i::Isolate::Current();
++  auto i_func = Utils::OpenDirectHandle(*function);
++  if (!i::IsJSFunction(*i_func)) {
++    return FunctionStatus::kNotFunction;
++  }
++  i::DirectHandle<i::JSFunction> js_func = i::Cast<i::JSFunction>(i_func);
++  FunctionValidationResult result = ValidateFunctionForHooking(isolate, js_func);
++  if (result == FunctionValidationResult::kNotCompiled) {
++    if (!EnsureFunctionCompiled(isolate, js_func)) {
++      return FunctionStatus::kNotCompiled;
++    }
++    return FunctionStatus::kOk;
++  }
++  return ToPublicStatus(result);
++}
++
++FunctionStatus ValidateFunctionPair(Local<Context> context,
++                                    Local<Function> target,
++                                    Local<Function> replacement) {
++  i::Isolate* isolate = i::Isolate::Current();
++
++  auto i_target = Utils::OpenDirectHandle(*target);
++  auto i_replacement = Utils::OpenDirectHandle(*replacement);
++
++  if (!i::IsJSFunction(*i_target)) {
++    return FunctionStatus::kNotFunction;
++  }
++  if (!i::IsJSFunction(*i_replacement)) {
++    return FunctionStatus::kNotFunction;
++  }
++
++  i::DirectHandle<i::JSFunction> target_handle = i::Cast<i::JSFunction>(i_target);
++  i::DirectHandle<i::JSFunction> replacement_handle = i::Cast<i::JSFunction>(i_replacement);
++
++  FunctionValidationResult target_result = ValidateFunctionForHooking(isolate, target_handle);
++  if (target_result != FunctionValidationResult::kValid &&
++      target_result != FunctionValidationResult::kNotCompiled) {
++    return ToPublicStatus(target_result);
++  }
++
++  FunctionValidationResult replacement_result = ValidateFunctionForHooking(isolate, replacement_handle);
++  if (replacement_result != FunctionValidationResult::kValid &&
++      replacement_result != FunctionValidationResult::kNotCompiled) {
++    return ToPublicStatus(replacement_result);
++  }
++
++  if (!EnsureFunctionCompiled(isolate, target_handle)) {
++    return FunctionStatus::kNotCompiled;
++  }
++  if (!EnsureFunctionCompiled(isolate, replacement_handle)) {
++    return FunctionStatus::kNotCompiled;
++  }
++
++  i::DirectHandle<i::SharedFunctionInfo> target_sfi(target_handle->shared(), isolate);
++  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi(replacement_handle->shared(), isolate);
++
++  if (!FunctionKindsCompatible(target_sfi->kind(), replacement_sfi->kind())) {
++    return FunctionStatus::kKindMismatch;
++  }
++
++  return FunctionStatus::kOk;
++}
++
 +void QueryObjects(Local<Context> context, Local<Object> prototype,
 +                  std::vector<Global<Object>>* objects) {
 +  Isolate* v8_isolate = reinterpret_cast<Isolate*>(i::Isolate::Current());
 +
 +  class MatchPrototypePredicate : public QueryObjectPredicate {
-+   public:
++    public:
 +    MatchPrototypePredicate(Local<Context> ctx, Local<Object> proto)
 +        : m_context(ctx), m_prototype(proto) {}
 +
@@ -150,14 +373,14 @@
 +      if (objectContext != m_context) return false;
 +
 +      for (Local<Value> proto = object->GetPrototypeV2();
-+           proto->IsObject();
-+           proto = proto.As<Object>()->GetPrototypeV2()) {
++            proto->IsObject();
++            proto = proto.As<Object>()->GetPrototypeV2()) {
 +        if (m_prototype == proto) return true;
 +      }
 +      return false;
 +    }
 +
-+   private:
++    private:
 +    Local<Context> m_context;
 +    Local<Object> m_prototype;
 +  };
@@ -167,7 +390,7 @@
 +}
 +
 +bool GetFunctionScopes(Isolate* isolate, Local<Function> function,
-+                       std::vector<ScopeInfo>* scopes) {
++                        std::vector<ScopeInfo>* scopes) {
 +  auto scope_iterator =
 +      debug::ScopeIterator::CreateForFunction(isolate, function);
 +  if (!scope_iterator) return false;
@@ -215,22 +438,403 @@
 +}
 +
 +MaybeLocal<Function> CloneFunction(Local<Context> context,
-+                                   Local<Function> function) {
-+  i::Isolate* i_isolate = i::Isolate::Current();
-+  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
++                                    Local<Function> function) {
++  i::Isolate* isolate = i::Isolate::Current();
++  i::DirectHandle<i::JSFunction> js_func =
++      i::Cast<i::JSFunction>(Utils::OpenDirectHandle(*function));
 +
-+  auto i_function = Utils::OpenDirectHandle(*function);
-+  if (!i::IsJSFunction(*i_function)) return MaybeLocal<Function>();
++  FunctionValidationResult validation = ValidateFunctionForHooking(isolate, js_func);
++  if (validation != FunctionValidationResult::kValid &&
++      validation != FunctionValidationResult::kNotCompiled) {
++    return MaybeLocal<Function>();
++  }
 +
-+  auto js_function = i::Cast<i::JSFunction>(i_function);
-+  i::DirectHandle<i::SharedFunctionInfo> shared =
-+      i::direct_handle(js_function->shared(), i_isolate);
-+  i::DirectHandle<i::Context> func_context =
-+      i::direct_handle(js_function->context(), i_isolate);
-+  i::Handle<i::JSFunction> new_function =
-+      i::Factory::JSFunctionBuilder(i_isolate, shared, func_context).Build();
++  if (!EnsureFunctionCompiled(isolate, js_func)) {
++    return MaybeLocal<Function>();
++  }
 +
-+  return Utils::ToLocal(new_function);
++  i::DirectHandle<i::SharedFunctionInfo> sfi(js_func->shared(), isolate);
++  i::DirectHandle<i::BytecodeArray> old_bc(sfi->GetBytecodeArray(isolate), isolate);
++  i::Handle<i::BytecodeArray> new_bc = isolate->factory()->NewBytecodeArray(
++      old_bc->length(),
++      reinterpret_cast<const uint8_t*>(old_bc->GetFirstBytecodeAddress()),
++      old_bc->frame_size(), old_bc->parameter_count(), old_bc->max_arguments(),
++      i::direct_handle(old_bc->constant_pool(), isolate),
++      i::direct_handle(old_bc->handler_table(), isolate));
++  new_bc->set_incoming_new_target_or_generator_register(
++      old_bc->incoming_new_target_or_generator_register());
++  if (old_bc->HasSourcePositionTable())
++    new_bc->set_source_position_table(old_bc->SourcePositionTable(), kReleaseStore);
++
++  i::Handle<i::SharedFunctionInfo> new_sfi =
++      isolate->factory()->CloneSharedFunctionInfo(sfi);
++
++  if (new_sfi->HasBaselineCode()) new_sfi->FlushBaselineCode();
++  new_sfi->SetActiveBytecodeArray(*new_bc, isolate);
++
++  i::Handle<i::JSFunction> new_func = i::Factory::JSFunctionBuilder(
++      isolate, new_sfi, i::direct_handle(js_func->context(), isolate)).Build();
++
++  new_func->UpdateCode(isolate, *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));
++
++  i::DirectHandle<i::FeedbackCell> new_feedback_cell = isolate->factory()->NewNoClosuresCell();
++  new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++
++  return Utils::ToLocal(new_func);
++}
++
++static Local<ArrayBuffer> ByteArrayToArrayBuffer(i::Isolate* isolate,
++                                                  const uint8_t* data,
++                                                  size_t length) {
++  Local<ArrayBuffer> buffer = ArrayBuffer::New(
++      reinterpret_cast<Isolate*>(isolate), length);
++  if (length > 0) {
++    memcpy(buffer->GetBackingStore()->Data(), data, length);
++  }
++  return buffer;
++}
++
++static Local<ArrayBuffer> TrustedByteArrayToBuffer(i::Isolate* isolate,
++                                                   i::Tagged<i::TrustedByteArray> arr) {
++  if (arr.is_null() || arr->length() == 0) {
++    return ArrayBuffer::New(reinterpret_cast<Isolate*>(isolate), 0);
++  }
++  return ByteArrayToArrayBuffer(isolate, arr->begin(), arr->length());
++}
++
++static const char* FunctionKindToString(i::FunctionKind kind) {
++  switch (kind) {
++    case i::FunctionKind::kNormalFunction: return "normal";
++    case i::FunctionKind::kArrowFunction: return "arrow";
++    case i::FunctionKind::kGeneratorFunction: return "generator";
++    case i::FunctionKind::kAsyncFunction: return "async";
++    case i::FunctionKind::kAsyncArrowFunction: return "asyncArrow";
++    case i::FunctionKind::kAsyncGeneratorFunction: return "asyncGenerator";
++    case i::FunctionKind::kConciseMethod: return "method";
++    case i::FunctionKind::kStaticConciseMethod: return "staticMethod";
++    case i::FunctionKind::kConciseGeneratorMethod: return "generatorMethod";
++    case i::FunctionKind::kStaticConciseGeneratorMethod: return "staticGeneratorMethod";
++    case i::FunctionKind::kAsyncConciseMethod: return "asyncMethod";
++    case i::FunctionKind::kStaticAsyncConciseMethod: return "staticAsyncMethod";
++    case i::FunctionKind::kAsyncConciseGeneratorMethod: return "asyncGeneratorMethod";
++    case i::FunctionKind::kStaticAsyncConciseGeneratorMethod: return "staticAsyncGeneratorMethod";
++    case i::FunctionKind::kGetterFunction: return "getter";
++    case i::FunctionKind::kStaticGetterFunction: return "staticGetter";
++    case i::FunctionKind::kSetterFunction: return "setter";
++    case i::FunctionKind::kStaticSetterFunction: return "staticSetter";
++    case i::FunctionKind::kClassMembersInitializerFunction: return "classInitializer";
++    case i::FunctionKind::kClassStaticInitializerFunction: return "staticInitializer";
++    case i::FunctionKind::kBaseConstructor: return "baseConstructor";
++    case i::FunctionKind::kDefaultBaseConstructor: return "defaultBaseConstructor";
++    case i::FunctionKind::kDerivedConstructor: return "derivedConstructor";
++    case i::FunctionKind::kDefaultDerivedConstructor: return "defaultDerivedConstructor";
++    default: return "unknown";
++  }
++}
++
++static i::FunctionKind StringToFunctionKind(const std::string& str) {
++  if (str == "normal") return i::FunctionKind::kNormalFunction;
++  if (str == "arrow") return i::FunctionKind::kArrowFunction;
++  if (str == "generator") return i::FunctionKind::kGeneratorFunction;
++  if (str == "async") return i::FunctionKind::kAsyncFunction;
++  if (str == "asyncArrow") return i::FunctionKind::kAsyncArrowFunction;
++  if (str == "asyncGenerator") return i::FunctionKind::kAsyncGeneratorFunction;
++  if (str == "method") return i::FunctionKind::kConciseMethod;
++  if (str == "staticMethod") return i::FunctionKind::kStaticConciseMethod;
++  if (str == "generatorMethod") return i::FunctionKind::kConciseGeneratorMethod;
++  if (str == "staticGeneratorMethod") return i::FunctionKind::kStaticConciseGeneratorMethod;
++  if (str == "asyncMethod") return i::FunctionKind::kAsyncConciseMethod;
++  if (str == "staticAsyncMethod") return i::FunctionKind::kStaticAsyncConciseMethod;
++  if (str == "asyncGeneratorMethod") return i::FunctionKind::kAsyncConciseGeneratorMethod;
++  if (str == "staticAsyncGeneratorMethod") return i::FunctionKind::kStaticAsyncConciseGeneratorMethod;
++  if (str == "getter") return i::FunctionKind::kGetterFunction;
++  if (str == "staticGetter") return i::FunctionKind::kStaticGetterFunction;
++  if (str == "setter") return i::FunctionKind::kSetterFunction;
++  if (str == "staticSetter") return i::FunctionKind::kStaticSetterFunction;
++  if (str == "classInitializer") return i::FunctionKind::kClassMembersInitializerFunction;
++  if (str == "staticInitializer") return i::FunctionKind::kClassStaticInitializerFunction;
++  if (str == "baseConstructor") return i::FunctionKind::kBaseConstructor;
++  if (str == "defaultBaseConstructor") return i::FunctionKind::kDefaultBaseConstructor;
++  if (str == "derivedConstructor") return i::FunctionKind::kDerivedConstructor;
++  if (str == "defaultDerivedConstructor") return i::FunctionKind::kDefaultDerivedConstructor;
++  return i::FunctionKind::kNormalFunction;
++}
++
++MaybeLocal<Object> DumpFunction(Local<Context> context,
++                                Local<Function> function) {
++  i::Isolate* isolate = i::Isolate::Current();
++  Isolate* v8_isolate = reinterpret_cast<Isolate*>(isolate);
++  i::DirectHandle<i::JSFunction> js_func =
++      i::Cast<i::JSFunction>(Utils::OpenDirectHandle(*function));
++
++  FunctionValidationResult validation = ValidateFunctionForHooking(isolate, js_func);
++  if (validation != FunctionValidationResult::kValid &&
++      validation != FunctionValidationResult::kNotCompiled) {
++    return MaybeLocal<Object>();
++  }
++
++  if (!EnsureFunctionCompiled(isolate, js_func)) {
++    return MaybeLocal<Object>();
++  }
++
++  i::DirectHandle<i::SharedFunctionInfo> sfi(js_func->shared(), isolate);
++  i::DirectHandle<i::BytecodeArray> bytecode(sfi->GetBytecodeArray(isolate), isolate);
++
++  Local<Object> result = Object::New(v8_isolate);
++
++  auto set = [&](const char* key, Local<Value> value) {
++    result->Set(context, String::NewFromUtf8(v8_isolate, key).ToLocalChecked(), value).Check();
++  };
++
++  auto setInt = [&](const char* key, int value) {
++    set(key, Integer::New(v8_isolate, value));
++  };
++
++  auto setBool = [&](const char* key, bool value) {
++    set(key, Boolean::New(v8_isolate, value));
++  };
++
++  auto setString = [&](const char* key, const char* value) {
++    set(key, String::NewFromUtf8(v8_isolate, value).ToLocalChecked());
++  };
++
++  size_t bc_length = bytecode->length();
++  const uint8_t* bc_data = reinterpret_cast<const uint8_t*>(bytecode->GetFirstBytecodeAddress());
++  set("bytecode", ByteArrayToArrayBuffer(isolate, bc_data, bc_length));
++
++  setInt("frameSize", bytecode->frame_size());
++  setInt("parameterCount", bytecode->parameter_count());
++  setInt("maxArguments", bytecode->max_arguments());
++  setInt("registerCount", bytecode->register_count());
++
++  i::Tagged<i::TrustedByteArray> handler_table = bytecode->handler_table();
++  set("handlerTable", TrustedByteArrayToBuffer(isolate, handler_table));
++
++  if (bytecode->HasSourcePositionTable()) {
++    i::Tagged<i::TrustedByteArray> source_positions = bytecode->SourcePositionTable();
++    set("sourcePositionTable", TrustedByteArrayToBuffer(isolate, source_positions));
++  } else {
++    set("sourcePositionTable", ArrayBuffer::New(v8_isolate, 0));
++  }
++
++  i::interpreter::Register reg = bytecode->incoming_new_target_or_generator_register();
++  setInt("incomingNewTargetOrGeneratorRegister", reg.is_valid() ? reg.index() : -1);
++
++  i::Tagged<i::TrustedFixedArray> const_pool = bytecode->constant_pool();
++  int pool_length = const_pool->length();
++  Local<Array> constants = Array::New(v8_isolate, pool_length);
++  for (int i = 0; i < pool_length; i++) {
++    i::Tagged<i::Object> elem = const_pool->get(i);
++    Local<Value> js_val;
++    if (i::IsSmi(elem)) {
++      js_val = Integer::New(v8_isolate, i::Smi::ToInt(elem));
++    } else if (i::IsHeapNumber(elem)) {
++      js_val = Number::New(v8_isolate, i::Cast<i::HeapNumber>(elem)->value());
++    } else if (i::IsString(elem)) {
++      js_val = Utils::ToLocal(i::direct_handle(i::Cast<i::String>(elem), isolate));
++    } else {
++      Local<Object> placeholder = Object::New(v8_isolate);
++      placeholder->Set(context, String::NewFromUtf8(v8_isolate, "_type").ToLocalChecked(),
++                      String::NewFromUtf8(v8_isolate, "object").ToLocalChecked()).Check();
++      js_val = placeholder;
++    }
++    constants->Set(context, i, js_val).Check();
++  }
++  set("constantPool", constants);
++
++  i::Tagged<i::String> name = sfi->Name();
++  if (name->length() > 0) {
++    set("name", Utils::ToLocal(i::direct_handle(name, isolate)));
++  } else {
++    set("name", String::Empty(v8_isolate));
++  }
++
++  i::Tagged<i::Object> inferred = sfi->inferred_name();
++  if (i::IsString(inferred) && i::Cast<i::String>(inferred)->length() > 0) {
++    set("inferredName", Utils::ToLocal(i::direct_handle(i::Cast<i::String>(inferred), isolate)));
++  } else {
++    set("inferredName", String::Empty(v8_isolate));
++  }
++
++  setString("kind", FunctionKindToString(sfi->kind()));
++  setBool("isStrict", i::is_strict(sfi->language_mode()));
++
++  setInt("formalParameterCount", sfi->internal_formal_parameter_count_without_receiver());
++  setInt("length", sfi->length());
++
++  setBool("isClassConstructor", i::IsClassConstructor(sfi->kind()));
++  setBool("isGenerator", i::IsGeneratorFunction(sfi->kind()));
++  setBool("isAsync", i::IsAsyncFunction(sfi->kind()));
++  setBool("isArrow", i::IsArrowFunction(sfi->kind()));
++  setBool("isConciseMethod", i::IsConciseMethod(sfi->kind()));
++
++  return result;
++}
++
++MaybeLocal<Function> BuildFunction(Local<Context> context,
++                                   Local<Object> data,
++                                   Local<Function> template_func) {
++  i::Isolate* isolate = i::Isolate::Current();
++  Isolate* v8_isolate = reinterpret_cast<Isolate*>(isolate);
++
++  auto get = [&](const char* key) -> Local<Value> {
++    return data->Get(context, String::NewFromUtf8(v8_isolate, key).ToLocalChecked())
++        .ToLocalChecked();
++  };
++
++  auto getInt = [&](const char* key) -> int {
++    return get(key)->Int32Value(context).FromMaybe(0);
++  };
++
++  Local<Value> bc_val = get("bytecode");
++  if (!bc_val->IsArrayBuffer()) {
++    return MaybeLocal<Function>();
++  }
++  Local<ArrayBuffer> bc_buffer = bc_val.As<ArrayBuffer>();
++  size_t bc_length = bc_buffer->ByteLength();
++  const uint8_t* bc_data = static_cast<const uint8_t*>(bc_buffer->GetBackingStore()->Data());
++
++  Local<Value> ht_val = get("handlerTable");
++  i::Handle<i::TrustedByteArray> handler_table;
++  if (ht_val->IsArrayBuffer()) {
++    Local<ArrayBuffer> ht_buffer = ht_val.As<ArrayBuffer>();
++    size_t ht_length = ht_buffer->ByteLength();
++    if (ht_length > 0) {
++      handler_table = isolate->factory()->NewTrustedByteArray(static_cast<int>(ht_length));
++      memcpy(handler_table->begin(),
++             ht_buffer->GetBackingStore()->Data(), ht_length);
++    } else {
++      handler_table = isolate->factory()->empty_trusted_byte_array();
++    }
++  } else {
++    handler_table = isolate->factory()->empty_trusted_byte_array();
++  }
++
++  Local<Value> cp_val = get("constantPool");
++  i::Handle<i::TrustedFixedArray> const_pool;
++  if (cp_val->IsArray()) {
++    Local<Array> cp_arr = cp_val.As<Array>();
++    int cp_length = cp_arr->Length();
++    const_pool = isolate->factory()->NewTrustedFixedArray(cp_length);
++    for (int idx = 0; idx < cp_length; idx++) {
++      Local<Value> elem = cp_arr->Get(context, idx).ToLocalChecked();
++      if (elem->IsInt32()) {
++        const_pool->set(idx, i::Smi::FromInt(elem->Int32Value(context).FromJust()));
++      } else if (elem->IsNumber()) {
++        i::Handle<i::HeapNumber> num = isolate->factory()->NewHeapNumber(elem->NumberValue(context).FromJust());
++        const_pool->set(idx, *num);
++      } else if (elem->IsString()) {
++        i::Handle<i::String> str = Utils::OpenHandle(*elem.As<String>());
++        const_pool->set(idx, *str);
++      } else {
++        const_pool->set(idx, i::Smi::zero());
++      }
++    }
++  } else {
++    const_pool = isolate->factory()->NewTrustedFixedArray(0);
++  }
++
++  int frame_size = getInt("frameSize");
++  int param_count = getInt("parameterCount");
++  int max_arguments = getInt("maxArguments");
++  int incoming_reg = getInt("incomingNewTargetOrGeneratorRegister");
++
++  i::Handle<i::BytecodeArray> new_bytecode = isolate->factory()->NewBytecodeArray(
++      static_cast<int>(bc_length),
++      bc_data,
++      frame_size,
++      param_count,
++      max_arguments,
++      const_pool,
++      handler_table);
++
++  if (incoming_reg >= 0) {
++    new_bytecode->set_incoming_new_target_or_generator_register(
++        i::interpreter::Register(incoming_reg));
++  }
++
++  Local<Value> sp_val = get("sourcePositionTable");
++  if (sp_val->IsArrayBuffer()) {
++    Local<ArrayBuffer> sp_buffer = sp_val.As<ArrayBuffer>();
++    size_t sp_length = sp_buffer->ByteLength();
++    if (sp_length > 0) {
++      i::Handle<i::TrustedByteArray> source_positions =
++          isolate->factory()->NewTrustedByteArray(static_cast<int>(sp_length));
++      memcpy(source_positions->begin(),
++             sp_buffer->GetBackingStore()->Data(), sp_length);
++      new_bytecode->set_source_position_table(*source_positions, kReleaseStore);
++    }
++  }
++
++  i::Handle<i::SharedFunctionInfo> new_sfi;
++  i::Handle<i::Context> func_context;
++
++  if (!template_func.IsEmpty()) {
++    i::DirectHandle<i::JSFunction> tmpl_func =
++        i::Cast<i::JSFunction>(Utils::OpenDirectHandle(*template_func));
++
++    FunctionValidationResult validation = ValidateFunctionForHooking(isolate, tmpl_func);
++    if (validation != FunctionValidationResult::kValid &&
++        validation != FunctionValidationResult::kNotCompiled) {
++      return MaybeLocal<Function>();
++    }
++
++    if (!EnsureFunctionCompiled(isolate, tmpl_func)) {
++      return MaybeLocal<Function>();
++    }
++
++    i::DirectHandle<i::SharedFunctionInfo> tmpl_sfi(tmpl_func->shared(), isolate);
++    new_sfi = isolate->factory()->CloneSharedFunctionInfo(tmpl_sfi);
++
++    if (new_sfi->HasBaselineCode()) new_sfi->FlushBaselineCode();
++    new_sfi->SetActiveBytecodeArray(*new_bytecode, isolate);
++
++    func_context = i::handle(tmpl_func->context(), isolate);
++  } else {
++    auto getBool = [&](const char* key) -> bool {
++      return get(key)->BooleanValue(v8_isolate);
++    };
++
++    auto getString = [&](const char* key) -> std::string {
++      Local<Value> val = get(key);
++      if (!val->IsString()) return "";
++      String::Utf8Value utf8(v8_isolate, val);
++      return std::string(*utf8, utf8.length());
++    };
++
++    std::string name_str = getString("name");
++    std::string kind_str = getString("kind");
++    bool is_strict = getBool("isStrict");
++    int formal_param_count = getInt("formalParameterCount");
++
++    i::FunctionKind kind = StringToFunctionKind(kind_str);
++    i::LanguageMode language_mode = is_strict ? i::LanguageMode::kStrict : i::LanguageMode::kSloppy;
++
++    i::Handle<i::String> name_handle = isolate->factory()->empty_string();
++    if (!name_str.empty()) {
++      name_handle = isolate->factory()->NewStringFromUtf8(
++          base::VectorOf(name_str)).ToHandleChecked();
++    }
++
++    new_sfi = isolate->factory()->NewSharedFunctionInfoForBuiltin(
++        name_handle, i::Builtin::kCompileLazy, formal_param_count, i::kDontAdapt, kind);
++
++    new_sfi->set_language_mode(language_mode);
++    new_sfi->set_internal_formal_parameter_count(i::JSParameterCount(formal_param_count));
++    new_sfi->SetActiveBytecodeArray(*new_bytecode, isolate);
++
++    func_context = i::handle(isolate->context()->native_context(), isolate);
++  }
++
++  i::Handle<i::JSFunction> new_func = i::Factory::JSFunctionBuilder(
++      isolate, new_sfi, func_context).Build();
++
++  new_func->UpdateCode(isolate, *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));
++
++  i::DirectHandle<i::FeedbackCell> new_feedback_cell = isolate->factory()->NewNoClosuresCell();
++  new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++
++  return Utils::ToLocal(new_func);
 +}
 +
 +bool HookFunction(Local<Context> context, Local<Function> target,
@@ -247,57 +851,51 @@
 +  i::DirectHandle<i::JSFunction> target_handle = i::Cast<i::JSFunction>(i_target);
 +  i::DirectHandle<i::JSFunction> replacement_handle = i::Cast<i::JSFunction>(i_replacement);
 +
-+  i::IsCompiledScope target_compiled_scope;
-+  if (!target_handle->shared()->HasBytecodeArray()) {
-+    if (!i::Compiler::Compile(i_isolate, target_handle,
-+                              i::Compiler::CLEAR_EXCEPTION,
-+                              &target_compiled_scope)) {
-+      return false;
-+    }
++  FunctionValidationResult target_validation = ValidateFunctionForHooking(i_isolate, target_handle);
++  if (target_validation != FunctionValidationResult::kValid &&
++      target_validation != FunctionValidationResult::kNotCompiled) {
++    return false;
 +  }
 +
-+  i::IsCompiledScope replacement_compiled_scope;
-+  if (!replacement_handle->shared()->HasBytecodeArray()) {
-+    if (!i::Compiler::Compile(i_isolate, replacement_handle,
-+                              i::Compiler::CLEAR_EXCEPTION,
-+                              &replacement_compiled_scope)) {
-+      return false;
-+    }
++  FunctionValidationResult replacement_validation = ValidateFunctionForHooking(i_isolate, replacement_handle);
++  if (replacement_validation != FunctionValidationResult::kValid &&
++      replacement_validation != FunctionValidationResult::kNotCompiled) {
++    return false;
 +  }
 +
-+  i::Tagged<i::JSFunction> target_func = *target_handle;
-+  i::Tagged<i::JSFunction> replacement_func = *replacement_handle;
++  if (!EnsureFunctionCompiled(i_isolate, target_handle)) {
++    return false;
++  }
 +
-+  i::Tagged<i::SharedFunctionInfo> target_sfi = target_func->shared();
-+  i::Tagged<i::SharedFunctionInfo> replacement_sfi = replacement_func->shared();
++  if (!EnsureFunctionCompiled(i_isolate, replacement_handle)) {
++    return false;
++  }
 +
-+  i::Deoptimizer::DeoptimizeFunction(target_func,
-+                                     i::LazyDeoptimizeReason::kDebugger);
-+  i::Deoptimizer::DeoptimizeFunction(replacement_func,
-+                                     i::LazyDeoptimizeReason::kDebugger);
++  i::DirectHandle<i::SharedFunctionInfo> target_sfi_handle(target_handle->shared(), i_isolate);
++  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi_handle(replacement_handle->shared(), i_isolate);
 +
-+  int identity_hash = target_func->GetOrCreateIdentityHash(i_isolate).value();
++  if (!FunctionKindsCompatible(target_sfi_handle->kind(), replacement_sfi_handle->kind())) {
++    return false;
++  }
++
++  int identity_hash = target_handle->GetOrCreateIdentityHash(i_isolate).value();
 +  auto& hooked = GetHookedFunctions();
 +
 +  i::Tagged<i::BytecodeArray> target_bytecode =
-+      target_sfi->GetBytecodeArray(i_isolate);
++      target_sfi_handle->GetBytecodeArray(i_isolate);
 +  i::Tagged<i::BytecodeArray> replacement_bytecode =
-+      replacement_sfi->GetBytecodeArray(i_isolate);
++      replacement_sfi_handle->GetBytecodeArray(i_isolate);
 +
 +  if (hooked.find(identity_hash) == hooked.end()) {
 +    hooked[identity_hash] = target_bytecode.ptr();
 +  }
 +
-+  if (target_sfi->HasBaselineCode()) {
-+    target_sfi->FlushBaselineCode();
-+  }
-+
-+  target_sfi->SetActiveBytecodeArray(replacement_bytecode, i_isolate);
-+  target_func->UpdateCode(i_isolate,
++  target_sfi_handle->SetActiveBytecodeArray(replacement_bytecode, i_isolate);
++  target_handle->UpdateCode(i_isolate,
 +      *BUILTIN_CODE(i_isolate, InterpreterEntryTrampoline));
 +
-+  i::Deoptimizer::DeoptimizeFunction(target_func,
-+                                     i::LazyDeoptimizeReason::kDebugger);
++  i::DirectHandle<i::FeedbackCell> new_feedback_cell = i_isolate->factory()->NewNoClosuresCell();
++  target_handle->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
 +
 +  return true;
 +}
@@ -308,32 +906,31 @@
 +  auto i_target = Utils::OpenDirectHandle(*target);
 +  if (!i::IsJSFunction(*i_target)) return false;
 +
-+  i::Tagged<i::JSFunction> target_func = *i::Cast<i::JSFunction>(i_target);
-+  int identity_hash = target_func->GetOrCreateIdentityHash(i_isolate).value();
++  i::DirectHandle<i::JSFunction> target_handle = i::Cast<i::JSFunction>(i_target);
++  int identity_hash = target_handle->GetOrCreateIdentityHash(i_isolate).value();
 +
 +  auto& hooked = GetHookedFunctions();
 +  auto it = hooked.find(identity_hash);
 +  if (it == hooked.end()) return false;
 +
-+  i::Tagged<i::SharedFunctionInfo> target_sfi = target_func->shared();
++  i::DirectHandle<i::SharedFunctionInfo> target_sfi_handle(target_handle->shared(), i_isolate);
 +
-+  i::Deoptimizer::DeoptimizeFunction(target_func,
-+                                     i::LazyDeoptimizeReason::kDebugger);
++  i::Deoptimizer::DeoptimizeFunction(*target_handle, i::LazyDeoptimizeReason::kDebugger);
 +
-+  if (target_sfi->HasBaselineCode()) {
-+    target_sfi->FlushBaselineCode();
++  if (target_sfi_handle->HasBaselineCode()) {
++    target_sfi_handle->FlushBaselineCode();
 +  }
 +
 +  i::Tagged<i::BytecodeArray> original_bytecode =
 +      i::TrustedCast<i::BytecodeArray>(
 +          i::Tagged<i::Object>(i::Address(it->second)));
-+  target_sfi->SetActiveBytecodeArray(original_bytecode, i_isolate);
++  target_sfi_handle->SetActiveBytecodeArray(original_bytecode, i_isolate);
 +
-+  target_func->UpdateCode(i_isolate,
++  target_handle->UpdateCode(i_isolate,
 +      *BUILTIN_CODE(i_isolate, InterpreterEntryTrampoline));
 +
-+  i::Deoptimizer::DeoptimizeFunction(target_func,
-+                                     i::LazyDeoptimizeReason::kDebugger);
++  i::DirectHandle<i::FeedbackCell> new_feedback_cell = i_isolate->factory()->NewNoClosuresCell();
++  target_handle->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
 +
 +  hooked.erase(it);
 +
@@ -354,7 +951,7 @@
 +}
 +
 +bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
-+                     Local<Object> new_handler) {
++                      Local<Object> new_handler) {
 +  i::Isolate* i_isolate = i::Isolate::Current();
 +  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
 +
@@ -374,12 +971,230 @@
 +}
 +
 +void GetProxyInternals(Local<Proxy> proxy, Local<Value>* target,
-+                       Local<Value>* handler) {
++                        Local<Value>* handler) {
 +  *target = proxy->GetTarget();
 +  *handler = proxy->GetHandler();
 +}
 +
++bool UnfreezeObject(Local<Context> context, Local<Object> object) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_object = Utils::OpenDirectHandle(*object);
++  if (!i::IsJSObject(*i_object)) return false;
++
++  i::DirectHandle<i::JSObject> js_object = i::Cast<i::JSObject>(i_object);
++
++  if (js_object->map()->is_extensible()) return true;
++
++  i::DirectHandle<i::Map> old_map(js_object->map(), i_isolate);
++
++  if (!old_map->is_dictionary_map()) {
++    i::JSObject::NormalizeProperties(i_isolate, js_object,
++                                      i::CLEAR_INOBJECT_PROPERTIES, 0,
++                                      "UnfreezeObject");
++  }
++
++  i::DirectHandle<i::Map> new_map =
++      i::Map::Copy(i_isolate, i::direct_handle(js_object->map(), i_isolate),
++                    "UnfreezeObject");
++  new_map->set_is_extensible(true);
++  i::JSObject::MigrateToMap(i_isolate, js_object, new_map);
++
++  i::ReadOnlyRoots roots(i_isolate);
++  if (i::IsJSGlobalObject(*js_object)) {
++    i::DirectHandle<i::GlobalDictionary> dictionary(
++        i::Cast<i::JSGlobalObject>(*js_object)->global_dictionary(kAcquireLoad),
++        i_isolate);
++    for (i::InternalIndex idx : dictionary->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!dictionary->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = dictionary->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~(i::DONT_DELETE | i::READ_ONLY));
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyCellType::kMutable);
++      dictionary->DetailsAtPut(idx, new_details);
++    }
++  } else if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
++    i::DirectHandle<i::SwissNameDictionary> dictionary(
++        js_object->property_dictionary_swiss(), i_isolate);
++    for (i::InternalIndex idx : dictionary->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!dictionary->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = dictionary->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~(i::DONT_DELETE | i::READ_ONLY));
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyConstness::kMutable);
++      dictionary->DetailsAtPut(idx, new_details);
++    }
++  } else {
++    i::DirectHandle<i::NameDictionary> dictionary(
++        js_object->property_dictionary(), i_isolate);
++    for (i::InternalIndex idx : dictionary->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!dictionary->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = dictionary->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~(i::DONT_DELETE | i::READ_ONLY));
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyConstness::kMutable);
++      dictionary->DetailsAtPut(idx, new_details);
++    }
++  }
++
++  if (js_object->HasDictionaryElements()) {
++    i::DirectHandle<i::NumberDictionary> elements(
++        js_object->element_dictionary(), i_isolate);
++    for (i::InternalIndex idx : elements->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!elements->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = elements->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~(i::DONT_DELETE | i::READ_ONLY));
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyConstness::kMutable);
++      elements->DetailsAtPut(idx, new_details);
++    }
++  }
++
++  return true;
++}
++
++bool UnsealObject(Local<Context> context, Local<Object> object) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_object = Utils::OpenDirectHandle(*object);
++  if (!i::IsJSObject(*i_object)) return false;
++
++  i::DirectHandle<i::JSObject> js_object = i::Cast<i::JSObject>(i_object);
++
++  if (js_object->map()->is_extensible()) return true;
++
++  i::DirectHandle<i::Map> old_map(js_object->map(), i_isolate);
++
++  if (!old_map->is_dictionary_map()) {
++    i::JSObject::NormalizeProperties(i_isolate, js_object,
++                                      i::CLEAR_INOBJECT_PROPERTIES, 0,
++                                      "UnsealObject");
++  }
++
++  i::DirectHandle<i::Map> new_map =
++      i::Map::Copy(i_isolate, i::direct_handle(js_object->map(), i_isolate),
++                    "UnsealObject");
++  new_map->set_is_extensible(true);
++  i::JSObject::MigrateToMap(i_isolate, js_object, new_map);
++
++  i::ReadOnlyRoots roots(i_isolate);
++  if (i::IsJSGlobalObject(*js_object)) {
++    i::DirectHandle<i::GlobalDictionary> dictionary(
++        i::Cast<i::JSGlobalObject>(*js_object)->global_dictionary(kAcquireLoad),
++        i_isolate);
++    for (i::InternalIndex idx : dictionary->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!dictionary->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = dictionary->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~i::DONT_DELETE);
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyCellType::kMutable);
++      dictionary->DetailsAtPut(idx, new_details);
++    }
++  } else if constexpr (V8_ENABLE_SWISS_NAME_DICTIONARY_BOOL) {
++    i::DirectHandle<i::SwissNameDictionary> dictionary(
++        js_object->property_dictionary_swiss(), i_isolate);
++    for (i::InternalIndex idx : dictionary->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!dictionary->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = dictionary->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~i::DONT_DELETE);
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyConstness::kMutable);
++      dictionary->DetailsAtPut(idx, new_details);
++    }
++  } else {
++    i::DirectHandle<i::NameDictionary> dictionary(
++        js_object->property_dictionary(), i_isolate);
++    for (i::InternalIndex idx : dictionary->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!dictionary->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = dictionary->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~i::DONT_DELETE);
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyConstness::kMutable);
++      dictionary->DetailsAtPut(idx, new_details);
++    }
++  }
++
++  if (js_object->HasDictionaryElements()) {
++    i::DirectHandle<i::NumberDictionary> elements(
++        js_object->element_dictionary(), i_isolate);
++    for (i::InternalIndex idx : elements->IterateEntries()) {
++      i::Tagged<i::Object> k;
++      if (!elements->ToKey(roots, idx, &k)) continue;
++      i::PropertyDetails details = elements->DetailsAt(idx);
++      i::PropertyAttributes attrs = details.attributes();
++      attrs = static_cast<i::PropertyAttributes>(attrs & ~i::DONT_DELETE);
++      i::PropertyDetails new_details(details.kind(), attrs,
++                                      i::PropertyConstness::kMutable);
++      elements->DetailsAtPut(idx, new_details);
++    }
++  }
++
++  return true;
++}
++
++bool MakeExtensible(Local<Context> context, Local<Object> object) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_object = Utils::OpenDirectHandle(*object);
++  if (!i::IsJSObject(*i_object)) return false;
++
++  i::DirectHandle<i::JSObject> js_object = i::Cast<i::JSObject>(i_object);
++
++  if (js_object->map()->is_extensible()) return true;
++
++  i::DirectHandle<i::Map> old_map(js_object->map(), i_isolate);
++
++  if (!old_map->is_dictionary_map()) {
++    i::JSObject::NormalizeProperties(i_isolate, js_object,
++                                      i::CLEAR_INOBJECT_PROPERTIES, 0,
++                                      "MakeExtensible");
++  }
++
++  i::DirectHandle<i::Map> new_map =
++      i::Map::Copy(i_isolate, i::direct_handle(js_object->map(), i_isolate),
++                    "MakeExtensible");
++  new_map->set_is_extensible(true);
++  i::JSObject::MigrateToMap(i_isolate, js_object, new_map);
++
++  return true;
++}
++
++bool OverwriteProperty(Local<Context> context, Local<Object> object,
++                        Local<Name> key, Local<Value> value,
++                        PropertyAttribute attributes) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  auto i_object = Utils::OpenDirectHandle(*object);
++  if (!i::IsJSObject(*i_object)) return false;
++
++  i::DirectHandle<i::JSObject> js_object = i::Cast<i::JSObject>(i_object);
++  i::DirectHandle<i::Name> i_key = Utils::OpenDirectHandle(*key);
++  i::DirectHandle<i::Object> i_value = Utils::OpenDirectHandle(*value);
++
++  i::PropertyAttributes attrs = static_cast<i::PropertyAttributes>(attributes);
++
++  i::LookupIterator it(i_isolate, js_object, i_key, js_object,
++                        i::LookupIterator::OWN);
++
++  Maybe<bool> result = i::JSObject::DefineOwnPropertyIgnoreAttributes(
++      &it, i_value, attrs, Just(i::kDontThrow));
++
++  return result.IsJust() && result.FromJust();
++}
++
 +}  // namespace callisto
- }  // namespace v8
- 
- #ifdef ENABLE_SLOW_DCHECKS
++}  // namespace v8

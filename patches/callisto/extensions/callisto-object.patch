@@ -11,7 +11,7 @@
      "console.cc",
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
-@@ -0,0 +1,393 @@
+@@ -0,0 +1,775 @@
 +#include "extensions/renderer/callisto_api.h"
 +
 +#include "extensions/renderer/script_context.h"
@@ -81,21 +81,27 @@
 +
 +  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "queryObjects requires a prototype argument")));
++        gin::StringToV8(isolate, "Callisto.queryObjects requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsObject() && !info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.queryObjects: argument must be a constructor or prototype object")));
 +    return;
 +  }
 +
 +  blink::WebLocalFrame* frame = GetFrameFromContext(isolate, context);
 +  if (!frame) {
 +    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Frame not available")));
++        gin::StringToV8(isolate, "Callisto.queryObjects: frame not available")));
 +    return;
 +  }
 +
 +  v8::Local<v8::Context> main_context = frame->MainWorldScriptContext();
 +  if (main_context.IsEmpty()) {
 +    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Main world context not available")));
++        gin::StringToV8(isolate, "Callisto.queryObjects: main world context not available")));
 +    return;
 +  }
 +
@@ -107,21 +113,17 @@
 +    v8::Local<v8::Value> proto_prop;
 +    if (!func->Get(context, gin::StringToV8(isolate, "prototype")).ToLocal(&proto_prop)) {
 +      isolate->ThrowException(v8::Exception::TypeError(
-+          gin::StringToV8(isolate, "Failed to get prototype property")));
++          gin::StringToV8(isolate, "Callisto.queryObjects: failed to get prototype property")));
 +      return;
 +    }
 +    if (!proto_prop->IsObject()) {
 +      isolate->ThrowException(v8::Exception::TypeError(
-+          gin::StringToV8(isolate, "Prototype must be an object")));
++          gin::StringToV8(isolate, "Callisto.queryObjects: constructor prototype is not an object")));
 +      return;
 +    }
 +    prototype = proto_prop.As<v8::Object>();
-+  } else if (prototype_arg->IsObject()) {
-+    prototype = prototype_arg.As<v8::Object>();
 +  } else {
-+    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "Argument must be a constructor or object")));
-+    return;
++    prototype = prototype_arg.As<v8::Object>();
 +  }
 +
 +  v8::Context::Scope main_context_scope(main_context);
@@ -143,9 +145,15 @@
 +  v8::HandleScope handle_scope(isolate);
 +  v8::Local<v8::Context> context = isolate->GetCurrentContext();
 +
-+  if (info.Length() < 1 || !info[0]->IsFunction()) {
++  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "dumpScopes requires a function argument")));
++        gin::StringToV8(isolate, "Callisto.dumpScopes requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.dumpScopes: argument is not a function")));
 +    return;
 +  }
 +
@@ -154,7 +162,7 @@
 +  std::vector<v8::callisto::ScopeInfo> scopes;
 +  if (!v8::callisto::GetFunctionScopes(isolate, func, &scopes)) {
 +    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Failed to get function scopes")));
++        gin::StringToV8(isolate, "Callisto.dumpScopes: failed to get function scopes")));
 +    return;
 +  }
 +
@@ -178,15 +186,53 @@
 +  info.GetReturnValue().Set(result);
 +}
 +
++static const char* FunctionStatusToString(v8::callisto::FunctionStatus status) {
++  switch (status) {
++    case v8::callisto::FunctionStatus::kOk:
++      return nullptr;
++    case v8::callisto::FunctionStatus::kNotFunction:
++      return "argument is not a function";
++    case v8::callisto::FunctionStatus::kBuiltinFunction:
++      return "native builtin functions are not supported";
++    case v8::callisto::FunctionStatus::kNativeFunction:
++      return "native functions are not supported";
++    case v8::callisto::FunctionStatus::kBoundFunction:
++      return "bound functions are not supported";
++    case v8::callisto::FunctionStatus::kApiFunction:
++      return "native API functions are not supported";
++    case v8::callisto::FunctionStatus::kWasmFunction:
++      return "WebAssembly functions are not supported";
++    case v8::callisto::FunctionStatus::kNotCompiled:
++      return "function could not be compiled";
++    case v8::callisto::FunctionStatus::kNoBytecode:
++      return "function has no bytecode";
++    case v8::callisto::FunctionStatus::kKindMismatch:
++      return "target and replacement function kinds must match";
++  }
++  return "unknown error";
++}
++
 +void CallistoAPI::HookFunction(
 +    const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
 +  v8::HandleScope handle_scope(isolate);
 +  v8::Local<v8::Context> context = isolate->GetCurrentContext();
 +
-+  if (info.Length() < 2 || !info[0]->IsFunction() || !info[1]->IsFunction()) {
++  if (info.Length() < 2) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "hookFunction requires two function arguments")));
++        gin::StringToV8(isolate, "Callisto.functions.hook requires 2 arguments")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.hook: first argument is not a function")));
++    return;
++  }
++
++  if (!info[1]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.hook: second argument is not a function")));
 +    return;
 +  }
 +
@@ -194,8 +240,19 @@
 +  v8::Local<v8::Function> replacement = info[1].As<v8::Function>();
 +
 +  if (v8::callisto::IsFunctionHooked(context, target)) {
-+    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Function is already hooked")));
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.hook: function is already hooked")));
++    return;
++  }
++
++  v8::callisto::FunctionStatus status =
++      v8::callisto::ValidateFunctionPair(context, target, replacement);
++
++  if (status != v8::callisto::FunctionStatus::kOk) {
++    std::string error = "Callisto.functions.hook: ";
++    error += FunctionStatusToString(status);
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, error)));
 +    return;
 +  }
 +
@@ -203,14 +260,14 @@
 +      v8::callisto::CloneFunction(context, target);
 +
 +  if (maybe_clone.IsEmpty()) {
-+    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Failed to clone original function")));
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.hook: failed to clone function")));
 +    return;
 +  }
 +
 +  if (!v8::callisto::HookFunction(context, target, replacement)) {
-+    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Failed to hook function")));
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.hook: hook operation failed")));
 +    return;
 +  }
 +
@@ -223,9 +280,15 @@
 +  v8::HandleScope handle_scope(isolate);
 +  v8::Local<v8::Context> context = isolate->GetCurrentContext();
 +
-+  if (info.Length() < 1 || !info[0]->IsFunction()) {
++  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "restoreFunction requires a function argument")));
++        gin::StringToV8(isolate, "Callisto.functions.restore requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.restore: argument is not a function")));
 +    return;
 +  }
 +
@@ -240,9 +303,15 @@
 +  v8::HandleScope handle_scope(isolate);
 +  v8::Local<v8::Context> context = isolate->GetCurrentContext();
 +
-+  if (info.Length() < 1 || !info[0]->IsFunction()) {
++  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "isFunctionHooked requires a function argument")));
++        gin::StringToV8(isolate, "Callisto.functions.isHooked requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.isHooked: argument is not a function")));
 +    return;
 +  }
 +
@@ -257,23 +326,132 @@
 +  v8::HandleScope handle_scope(isolate);
 +  v8::Local<v8::Context> context = isolate->GetCurrentContext();
 +
-+  if (info.Length() < 1 || !info[0]->IsFunction()) {
++  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "cloneFunction requires a function argument")));
++        gin::StringToV8(isolate, "Callisto.functions.clone requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.clone: argument is not a function")));
 +    return;
 +  }
 +
 +  v8::Local<v8::Function> target = info[0].As<v8::Function>();
++
++  v8::callisto::FunctionStatus status =
++      v8::callisto::ValidateFunction(context, target);
++
++  if (status != v8::callisto::FunctionStatus::kOk) {
++    std::string error = "Callisto.functions.clone: ";
++    error += FunctionStatusToString(status);
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, error)));
++    return;
++  }
++
 +  v8::MaybeLocal<v8::Function> maybe_clone =
 +      v8::callisto::CloneFunction(context, target);
 +
 +  if (maybe_clone.IsEmpty()) {
-+    isolate->ThrowException(v8::Exception::Error(
-+        gin::StringToV8(isolate, "Failed to clone function")));
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.clone: clone operation failed")));
 +    return;
 +  }
 +
 +  info.GetReturnValue().Set(maybe_clone.ToLocalChecked());
++}
++
++void CallistoAPI::Dump(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.dump requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.dump: argument is not a function")));
++    return;
++  }
++
++  v8::Local<v8::Function> target = info[0].As<v8::Function>();
++
++  v8::callisto::FunctionStatus status =
++      v8::callisto::ValidateFunction(context, target);
++
++  if (status != v8::callisto::FunctionStatus::kOk) {
++    std::string error = "Callisto.functions.dump: ";
++    error += FunctionStatusToString(status);
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, error)));
++    return;
++  }
++
++  v8::MaybeLocal<v8::Object> maybe_data =
++      v8::callisto::DumpFunction(context, target);
++
++  if (maybe_data.IsEmpty()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.dump: failed to dump function")));
++    return;
++  }
++
++  info.GetReturnValue().Set(maybe_data.ToLocalChecked());
++}
++
++void CallistoAPI::Build(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.build requires at least 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsObject()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.build: first argument is not an object")));
++    return;
++  }
++
++  v8::Local<v8::Object> data = info[0].As<v8::Object>();
++
++  v8::Local<v8::Function> template_func;
++  if (info.Length() >= 2 && info[1]->IsFunction()) {
++    template_func = info[1].As<v8::Function>();
++
++    v8::callisto::FunctionStatus status =
++        v8::callisto::ValidateFunction(context, template_func);
++
++    if (status != v8::callisto::FunctionStatus::kOk) {
++      std::string error = "Callisto.functions.build: template function - ";
++      error += FunctionStatusToString(status);
++      isolate->ThrowException(v8::Exception::TypeError(
++          gin::StringToV8(isolate, error)));
++      return;
++    }
++  }
++
++  v8::MaybeLocal<v8::Function> maybe_func =
++      v8::callisto::BuildFunction(context, data, template_func);
++
++  if (maybe_func.IsEmpty()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.build: failed to build function")));
++    return;
++  }
++
++  info.GetReturnValue().Set(maybe_func.ToLocalChecked());
 +}
 +
 +void CallistoAPI::PatchProxy(
@@ -284,18 +462,19 @@
 +
 +  if (info.Length() < 2) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "patchProxy requires proxy and handler arguments")));
++        gin::StringToV8(isolate, "Callisto.proxies.patch requires 2 arguments")));
 +    return;
 +  }
 +
 +  if (!info[0]->IsProxy()) {
-+    info.GetReturnValue().Set(false);
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.proxies.patch: first argument is not a Proxy")));
 +    return;
 +  }
 +
 +  if (!info[1]->IsObject()) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "Handler must be an object")));
++        gin::StringToV8(isolate, "Callisto.proxies.patch: second argument is not an object")));
 +    return;
 +  }
 +
@@ -303,7 +482,8 @@
 +  v8::Local<v8::Object> new_handler = info[1].As<v8::Object>();
 +
 +  if (proxy->IsRevoked()) {
-+    info.GetReturnValue().Set(false);
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.proxies.patch: cannot patch revoked Proxy")));
 +    return;
 +  }
 +
@@ -319,19 +499,21 @@
 +
 +  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "unwrapProxy requires a proxy argument")));
++        gin::StringToV8(isolate, "Callisto.proxies.unwrap requires 1 argument")));
 +    return;
 +  }
 +
 +  if (!info[0]->IsProxy()) {
-+    info.GetReturnValue().Set(false);
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.proxies.unwrap: argument is not a Proxy")));
 +    return;
 +  }
 +
 +  v8::Local<v8::Proxy> proxy = info[0].As<v8::Proxy>();
 +
 +  if (proxy->IsRevoked()) {
-+    info.GetReturnValue().Set(v8::Null(isolate));
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.proxies.unwrap: cannot unwrap revoked Proxy")));
 +    return;
 +  }
 +
@@ -340,8 +522,8 @@
 +  v8::callisto::GetProxyInternals(proxy, &target, &handler);
 +
 +  v8::Local<v8::Object> result = v8::Object::New(isolate);
-+  result->Set(context, gin::StringToV8(isolate, "handler"), handler).Check();
 +  result->Set(context, gin::StringToV8(isolate, "target"), target).Check();
++  result->Set(context, gin::StringToV8(isolate, "handler"), handler).Check();
 +
 +  info.GetReturnValue().Set(result);
 +}
@@ -352,11 +534,188 @@
 +
 +  if (info.Length() < 1) {
 +    isolate->ThrowException(v8::Exception::TypeError(
-+        gin::StringToV8(isolate, "isProxy requires an argument")));
++        gin::StringToV8(isolate, "Callisto.proxies.isProxy requires 1 argument")));
 +    return;
 +  }
 +
 +  info.GetReturnValue().Set(info[0]->IsProxy());
++}
++
++void CallistoAPI::UnfreezeObject(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.unfreeze requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsObject()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.unfreeze: argument is not an object")));
++    return;
++  }
++
++  v8::Local<v8::Object> target = info[0].As<v8::Object>();
++  bool success = v8::callisto::UnfreezeObject(context, target);
++  info.GetReturnValue().Set(success);
++}
++
++void CallistoAPI::UnsealObject(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.unseal requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsObject()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.unseal: argument is not an object")));
++    return;
++  }
++
++  v8::Local<v8::Object> target = info[0].As<v8::Object>();
++  bool success = v8::callisto::UnsealObject(context, target);
++  info.GetReturnValue().Set(success);
++}
++
++void CallistoAPI::MakeExtensible(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.makeExtensible requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsObject()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.makeExtensible: argument is not an object")));
++    return;
++  }
++
++  v8::Local<v8::Object> target = info[0].As<v8::Object>();
++  bool success = v8::callisto::MakeExtensible(context, target);
++  info.GetReturnValue().Set(success);
++}
++
++void CallistoAPI::OverwriteProperty(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 3) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.overwriteProperty requires 3 arguments")));
++    return;
++  }
++
++  if (!info[0]->IsObject()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.overwriteProperty: first argument is not an object")));
++    return;
++  }
++
++  v8::Local<v8::Object> target = info[0].As<v8::Object>();
++
++  v8::Local<v8::Name> key;
++  if (info[1]->IsString()) {
++    key = info[1].As<v8::String>();
++  } else if (info[1]->IsSymbol()) {
++    key = info[1].As<v8::Symbol>();
++  } else {
++    v8::MaybeLocal<v8::String> maybe_str = info[1]->ToString(context);
++    if (!maybe_str.ToLocal(&key)) {
++      isolate->ThrowException(v8::Exception::TypeError(
++          gin::StringToV8(isolate, "Callisto.objects.overwriteProperty: second argument must be a string or symbol")));
++      return;
++    }
++  }
++
++  if (!info[2]->IsObject()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.objects.overwriteProperty: third argument must be a descriptor object")));
++    return;
++  }
++
++  v8::Local<v8::Object> descriptor = info[2].As<v8::Object>();
++
++  v8::Local<v8::Value> value_val;
++  v8::Local<v8::Value> writable_val;
++  v8::Local<v8::Value> enumerable_val;
++  v8::Local<v8::Value> configurable_val;
++
++  bool has_value = descriptor->Get(context, gin::StringToV8(isolate, "value")).ToLocal(&value_val) && !value_val->IsUndefined();
++  bool has_writable = descriptor->Get(context, gin::StringToV8(isolate, "writable")).ToLocal(&writable_val) && !writable_val->IsUndefined();
++  bool has_enumerable = descriptor->Get(context, gin::StringToV8(isolate, "enumerable")).ToLocal(&enumerable_val) && !enumerable_val->IsUndefined();
++  bool has_configurable = descriptor->Get(context, gin::StringToV8(isolate, "configurable")).ToLocal(&configurable_val) && !configurable_val->IsUndefined();
++
++  v8::PropertyAttribute current_attrs = v8::None;
++  v8::Local<v8::Value> current_value;
++  bool property_exists = false;
++
++  v8::Maybe<v8::PropertyAttribute> maybe_attrs = target->GetPropertyAttributes(context, key);
++  if (maybe_attrs.IsJust() && static_cast<int>(maybe_attrs.FromJust()) != static_cast<int>(v8::PropertyAttribute::None) - 1) {
++    v8::PropertyAttribute attr = maybe_attrs.FromJust();
++    if (static_cast<int>(attr) >= 0) {
++      property_exists = true;
++      current_attrs = attr;
++      target->Get(context, key).ToLocal(&current_value);
++    }
++  }
++
++  v8::Local<v8::Value> final_value;
++  if (has_value) {
++    final_value = value_val;
++  } else if (property_exists && !current_value.IsEmpty()) {
++    final_value = current_value;
++  } else {
++    final_value = v8::Undefined(isolate);
++  }
++
++  int attrs = 0;
++
++  if (has_writable) {
++    if (!writable_val->BooleanValue(isolate)) {
++      attrs |= v8::ReadOnly;
++    }
++  } else if (property_exists && (current_attrs & v8::ReadOnly)) {
++    attrs |= v8::ReadOnly;
++  }
++
++  if (has_enumerable) {
++    if (!enumerable_val->BooleanValue(isolate)) {
++      attrs |= v8::DontEnum;
++    }
++  } else if (property_exists && (current_attrs & v8::DontEnum)) {
++    attrs |= v8::DontEnum;
++  }
++
++  if (has_configurable) {
++    if (!configurable_val->BooleanValue(isolate)) {
++      attrs |= v8::DontDelete;
++    }
++  } else if (property_exists && (current_attrs & v8::DontDelete)) {
++    attrs |= v8::DontDelete;
++  }
++
++  bool success = v8::callisto::OverwriteProperty(
++      context, target, key, final_value,
++      static_cast<v8::PropertyAttribute>(attrs));
++
++  info.GetReturnValue().Set(success);
 +}
 +
 +bool CallistoAPI::CreateForContext(ScriptContext* context) {
@@ -381,33 +740,56 @@
 +
 +  v8::Local<v8::Object> callisto = v8::Object::New(isolate);
 +
-+  auto set_method = [&](const char* name, v8::FunctionCallback callback) {
++  auto set_method = [&](v8::Local<v8::Object> obj, const char* name,
++                        v8::FunctionCallback callback) {
 +    v8::Local<v8::Function> func =
 +        v8::Function::New(v8_context, callback).ToLocalChecked();
-+    callisto->Set(v8_context, gin::StringToV8(isolate, name), func).Check();
++    obj->Set(v8_context, gin::StringToV8(isolate, name), func).Check();
 +  };
 +
-+  set_method("queryObjects", QueryObjects);
-+  set_method("dumpScopes", DumpScopes);
-+  set_method("hookFunction", HookFunction);
-+  set_method("restoreFunction", RestoreFunction);
-+  set_method("isFunctionHooked", IsFunctionHooked);
-+  set_method("cloneFunction", CloneFunction);
-+  set_method("patchProxy", PatchProxy);
-+  set_method("unwrapProxy", UnwrapProxy);
-+  set_method("isProxy", IsProxy);
++  set_method(callisto, "queryObjects", QueryObjects);
++  set_method(callisto, "dumpScopes", DumpScopes);
++
++  v8::Local<v8::Object> functions = v8::Object::New(isolate);
++  set_method(functions, "hook", HookFunction);
++  set_method(functions, "restore", RestoreFunction);
++  set_method(functions, "isHooked", IsFunctionHooked);
++  set_method(functions, "clone", CloneFunction);
++  set_method(functions, "dump", Dump);
++  set_method(functions, "build", Build);
++  callisto->Set(v8_context, gin::StringToV8(isolate, "functions"), functions).Check();
++
++  v8::Local<v8::Object> proxies = v8::Object::New(isolate);
++  set_method(proxies, "patch", PatchProxy);
++  set_method(proxies, "unwrap", UnwrapProxy);
++  set_method(proxies, "isProxy", IsProxy);
++  callisto->Set(v8_context, gin::StringToV8(isolate, "proxies"), proxies).Check();
++
++  v8::Local<v8::Object> objects = v8::Object::New(isolate);
++  set_method(objects, "unfreeze", UnfreezeObject);
++  set_method(objects, "unseal", UnsealObject);
++  set_method(objects, "makeExtensible", MakeExtensible);
++  set_method(objects, "overwriteProperty", OverwriteProperty);
++  callisto->Set(v8_context, gin::StringToV8(isolate, "objects"), objects).Check();
 +
 +  v8::Local<v8::Object> global = v8_context->Global();
++
 +  v8::Maybe<bool> success = global->Set(
 +      v8_context, gin::StringToV8(isolate, "Callisto"), callisto);
 +
-+  return success.IsJust() && success.FromJust();
++  if (!success.IsJust() || !success.FromJust()) {
++    return false;
++  }
++
++  global->Set(v8_context, gin::StringToV8(isolate, "C"), callisto).Check();
++
++  return true;
 +}
 +
 +}  // namespace extensions
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.h
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,41 @@
 +#ifndef EXTENSIONS_RENDERER_CALLISTO_API_H_
 +#define EXTENSIONS_RENDERER_CALLISTO_API_H_
 +
@@ -432,9 +814,15 @@
 +  static void RestoreFunction(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void IsFunctionHooked(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void CloneFunction(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void Dump(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void Build(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void PatchProxy(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void UnwrapProxy(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void IsProxy(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void UnfreezeObject(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void UnsealObject(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void MakeExtensible(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void OverwriteProperty(const v8::FunctionCallbackInfo<v8::Value>& info);
 +
 +  static blink::WebLocalFrame* GetFrameFromContext(v8::Isolate* isolate,
 +                                                   v8::Local<v8::Context> context);
