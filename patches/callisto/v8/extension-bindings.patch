@@ -20,8 +20,10 @@
      "native_extension_bindings_system.cc",
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,1074 @@
 +#include "extensions/renderer/callisto_api.h"
++
++#include <cstring>
 +
 +#include "extensions/renderer/script_context.h"
 +#include "gin/converter.h"
@@ -42,6 +44,9 @@
 +namespace {
 +
 +const char kCallistoFrameKey[] = "callisto_frame";
++const char kLiveScopeFunctionKey[] = "live_scope_function";
++const char kLiveScopeIndexKey[] = "live_scope_index";
++const char kLiveScopeTypeKey[] = "live_scope_type";
 +
 +const char* ScopeTypeToString(v8::callisto::ScopeInfo::Type type) {
 +  switch (type) {
@@ -66,6 +71,291 @@
 +    default:
 +      return "Unknown";
 +  }
++}
++
++// Helper to extract function and scope index from a LiveScope proxy handler
++bool GetLiveScopeData(v8::Isolate* isolate,
++                      v8::Local<v8::Object> handler,
++                      v8::Local<v8::Function>* out_function,
++                      int* out_scope_index) {
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  v8::Local<v8::Private> func_key = v8::Private::ForApi(
++      isolate, gin::StringToV8(isolate, kLiveScopeFunctionKey).As<v8::String>());
++  v8::Local<v8::Private> idx_key = v8::Private::ForApi(
++      isolate, gin::StringToV8(isolate, kLiveScopeIndexKey).As<v8::String>());
++
++  v8::Local<v8::Value> func_val;
++  v8::Local<v8::Value> idx_val;
++
++  if (!handler->GetPrivate(context, func_key).ToLocal(&func_val) ||
++      !func_val->IsFunction()) {
++    return false;
++  }
++  if (!handler->GetPrivate(context, idx_key).ToLocal(&idx_val) ||
++      !idx_val->IsInt32()) {
++    return false;
++  }
++
++  *out_function = func_val.As<v8::Function>();
++  *out_scope_index = idx_val->Int32Value(context).FromJust();
++  return true;
++}
++
++// LiveScope proxy trap: get
++void LiveScopeTrapGet(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 2) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::Local<v8::Value> property = info[1];
++
++  // Handle Symbol.toStringTag for nice console output
++  if (property->IsSymbol()) {
++    v8::Local<v8::Symbol> sym = property.As<v8::Symbol>();
++    v8::Local<v8::Value> desc = sym->Description(isolate);
++    if (desc->IsString()) {
++      v8::String::Utf8Value utf8(isolate, desc);
++      if (strcmp(*utf8, "Symbol.toStringTag") == 0) {
++        // Get scope type from handler
++        v8::Local<v8::Object> handler = info.This().As<v8::Object>();
++        v8::Local<v8::Private> type_key = v8::Private::ForApi(
++            isolate, gin::StringToV8(isolate, kLiveScopeTypeKey).As<v8::String>());
++        v8::Local<v8::Value> type_val;
++        if (handler->GetPrivate(context, type_key).ToLocal(&type_val) && type_val->IsString()) {
++          info.GetReturnValue().Set(type_val);
++          return;
++        }
++        info.GetReturnValue().Set(gin::StringToV8(isolate, "LiveScope"));
++        return;
++      }
++    }
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  if (!property->IsString()) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::Local<v8::Object> handler = info.This().As<v8::Object>();
++  v8::Local<v8::Function> function;
++  int scope_index;
++
++  if (!GetLiveScopeData(isolate, handler, &function, &scope_index)) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::Local<v8::String> name = property.As<v8::String>();
++  v8::MaybeLocal<v8::Value> result =
++      v8::callisto::GetScopeVariable(isolate, function, scope_index, name);
++
++  if (result.IsEmpty()) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  info.GetReturnValue().Set(result.ToLocalChecked());
++}
++
++// LiveScope proxy trap: set
++void LiveScopeTrapSet(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++
++  if (info.Length() < 3) {
++    info.GetReturnValue().Set(false);
++    return;
++  }
++
++  v8::Local<v8::Value> property = info[1];
++  v8::Local<v8::Value> value = info[2];
++
++  if (!property->IsString()) {
++    info.GetReturnValue().Set(false);
++    return;
++  }
++
++  v8::Local<v8::Object> handler = info.This().As<v8::Object>();
++  v8::Local<v8::Function> function;
++  int scope_index;
++
++  if (!GetLiveScopeData(isolate, handler, &function, &scope_index)) {
++    info.GetReturnValue().Set(false);
++    return;
++  }
++
++  v8::Local<v8::String> name = property.As<v8::String>();
++  bool success =
++      v8::callisto::SetScopeVariable(isolate, function, scope_index, name, value);
++
++  info.GetReturnValue().Set(success);
++}
++
++// LiveScope proxy trap: has
++void LiveScopeTrapHas(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++
++  if (info.Length() < 2) {
++    info.GetReturnValue().Set(false);
++    return;
++  }
++
++  v8::Local<v8::Value> property = info[1];
++
++  if (!property->IsString()) {
++    info.GetReturnValue().Set(false);
++    return;
++  }
++
++  v8::Local<v8::Object> handler = info.This().As<v8::Object>();
++  v8::Local<v8::Function> function;
++  int scope_index;
++
++  if (!GetLiveScopeData(isolate, handler, &function, &scope_index)) {
++    info.GetReturnValue().Set(false);
++    return;
++  }
++
++  v8::Local<v8::String> name = property.As<v8::String>();
++  bool has = v8::callisto::HasScopeVariable(isolate, function, scope_index, name);
++
++  info.GetReturnValue().Set(has);
++}
++
++// LiveScope proxy trap: ownKeys
++void LiveScopeTrapOwnKeys(const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++
++  v8::Local<v8::Object> handler = info.This().As<v8::Object>();
++  v8::Local<v8::Function> function;
++  int scope_index;
++
++  if (!GetLiveScopeData(isolate, handler, &function, &scope_index)) {
++    info.GetReturnValue().Set(v8::Array::New(isolate));
++    return;
++  }
++
++  v8::MaybeLocal<v8::Array> result =
++      v8::callisto::GetScopeVariableNames(isolate, function, scope_index);
++
++  if (result.IsEmpty()) {
++    info.GetReturnValue().Set(v8::Array::New(isolate));
++    return;
++  }
++
++  info.GetReturnValue().Set(result.ToLocalChecked());
++}
++
++// LiveScope proxy trap: getOwnPropertyDescriptor
++void LiveScopeTrapGetOwnPropertyDescriptor(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 2) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::Local<v8::Value> property = info[1];
++
++  if (!property->IsString()) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::Local<v8::Object> handler = info.This().As<v8::Object>();
++  v8::Local<v8::Function> function;
++  int scope_index;
++
++  if (!GetLiveScopeData(isolate, handler, &function, &scope_index)) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::Local<v8::String> name = property.As<v8::String>();
++
++  if (!v8::callisto::HasScopeVariable(isolate, function, scope_index, name)) {
++    info.GetReturnValue().Set(v8::Undefined(isolate));
++    return;
++  }
++
++  v8::MaybeLocal<v8::Value> value_result =
++      v8::callisto::GetScopeVariable(isolate, function, scope_index, name);
++
++  v8::Local<v8::Object> descriptor = v8::Object::New(isolate);
++  if (!value_result.IsEmpty()) {
++    descriptor->Set(context, gin::StringToV8(isolate, "value"),
++                    value_result.ToLocalChecked()).Check();
++  } else {
++    descriptor->Set(context, gin::StringToV8(isolate, "value"),
++                    v8::Undefined(isolate)).Check();
++  }
++  descriptor->Set(context, gin::StringToV8(isolate, "writable"),
++                  v8::Boolean::New(isolate, true)).Check();
++  descriptor->Set(context, gin::StringToV8(isolate, "enumerable"),
++                  v8::Boolean::New(isolate, true)).Check();
++  descriptor->Set(context, gin::StringToV8(isolate, "configurable"),
++                  v8::Boolean::New(isolate, true)).Check();
++
++  info.GetReturnValue().Set(descriptor);
++}
++
++// Create a LiveScope proxy for a function and scope index
++v8::Local<v8::Proxy> CreateLiveScopeProxy(
++    v8::Isolate* isolate,
++    v8::Local<v8::Context> context,
++    v8::Local<v8::Function> function,
++    int scope_index,
++    v8::callisto::ScopeInfo::Type scope_type,
++    v8::Local<v8::Object> scope_snapshot) {
++  // Create handler object with trapped methods
++  v8::Local<v8::Object> handler = v8::Object::New(isolate);
++
++  auto set_trap = [&](const char* name, v8::FunctionCallback callback) {
++    v8::Local<v8::Function> func =
++        v8::Function::New(context, callback).ToLocalChecked();
++    handler->Set(context, gin::StringToV8(isolate, name), func).Check();
++  };
++
++  set_trap("get", LiveScopeTrapGet);
++  set_trap("set", LiveScopeTrapSet);
++  set_trap("has", LiveScopeTrapHas);
++  set_trap("ownKeys", LiveScopeTrapOwnKeys);
++  set_trap("getOwnPropertyDescriptor", LiveScopeTrapGetOwnPropertyDescriptor);
++
++  // Store function and scope index in handler's private fields
++  v8::Local<v8::Private> func_key = v8::Private::ForApi(
++      isolate, gin::StringToV8(isolate, kLiveScopeFunctionKey).As<v8::String>());
++  v8::Local<v8::Private> idx_key = v8::Private::ForApi(
++      isolate, gin::StringToV8(isolate, kLiveScopeIndexKey).As<v8::String>());
++  v8::Local<v8::Private> type_key = v8::Private::ForApi(
++      isolate, gin::StringToV8(isolate, kLiveScopeTypeKey).As<v8::String>());
++
++  handler->SetPrivate(context, func_key, function).Check();
++  handler->SetPrivate(context, idx_key, v8::Integer::New(isolate, scope_index)).Check();
++
++  // Store scope type name for toStringTag
++  std::string type_name = "LiveScope<";
++  type_name += ScopeTypeToString(scope_type);
++  type_name += ">";
++  handler->SetPrivate(context, type_key,
++                      gin::StringToV8(isolate, type_name)).Check();
++
++  // Use the scope snapshot as target so DevTools can display the variables
++  // The proxy traps still handle all actual get/set for live behavior
++  return v8::Proxy::New(context, scope_snapshot, handler).ToLocalChecked();
 +}
 +
 +}  // namespace
@@ -177,19 +467,28 @@
 +
 +  v8::Local<v8::Object> result = v8::Object::New(isolate);
 +
++  // Track scope index for each type separately isn't needed - we use global index
++  int scope_index = 0;
 +  for (const auto& scope : scopes) {
 +    const char* type_name = ScopeTypeToString(scope.type);
 +    v8::Local<v8::String> type_key = gin::StringToV8(isolate, type_name).As<v8::String>();
 +
++    // Create a LiveScope proxy for this scope, using the snapshot as target
++    // so DevTools can display the variables while traps handle live access
++    v8::Local<v8::Proxy> live_scope =
++        CreateLiveScopeProxy(isolate, context, func, scope_index, scope.type, scope.object);
++
 +    v8::Local<v8::Value> existing;
 +    if (result->Get(context, type_key).ToLocal(&existing) && existing->IsArray()) {
 +      v8::Local<v8::Array> arr = existing.As<v8::Array>();
-+      arr->Set(context, arr->Length(), scope.object).Check();
++      arr->Set(context, arr->Length(), live_scope).Check();
 +    } else {
 +      v8::Local<v8::Array> arr = v8::Array::New(isolate, 1);
-+      arr->Set(context, 0, scope.object).Check();
++      arr->Set(context, 0, live_scope).Check();
 +      result->Set(context, type_key, arr).Check();
 +    }
++
++    scope_index++;
 +  }
 +
 +  info.GetReturnValue().Set(result);

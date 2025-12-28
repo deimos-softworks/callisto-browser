@@ -10,7 +10,7 @@
      "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
 +++ b/v8/src/api/api-callisto.cc
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1163 @@
 +// Internal implementation of Callisto API's
 +
 +#include "include/v8-callisto.h"
@@ -26,12 +26,15 @@
 +#include "src/debug/debug-interface.h"
 +#include "src/debug/debug-scope-iterator.h"
 +#include "src/deoptimizer/deoptimizer.h"
++#include "src/init/isolate-group.h"
 +#include "src/interpreter/bytecode-array-iterator.h"
 +#include "src/interpreter/interpreter.h"
++#include "src/objects/code-inl.h"
 +#include "src/objects/heap-object-inl.h"
 +#include "src/objects/js-function-inl.h"
 +#include "src/objects/js-proxy-inl.h"
 +#include "src/objects/shared-function-info-inl.h"
++#include "src/sandbox/js-dispatch-table-inl.h"
 +
 +#ifdef GetObject
 +#undef GetObject
@@ -40,11 +43,37 @@
 +namespace v8 {
 +namespace callisto {
 +
-+// Internal state and helpers
++struct HookState {
++  i::Address original_entrypoint;
++  i::Address original_context;
++  i::Address original_feedback_cell;
++};
 +
-+static std::unordered_map<int, i::Address>& GetHookedFunctions() {
-+  static std::unordered_map<int, i::Address> hooked_functions;
++static std::unordered_map<uint32_t, HookState>& GetHookedFunctions() {
++  static std::unordered_map<uint32_t, HookState> hooked_functions;
 +  return hooked_functions;
++}
++
++static bool ForceCompileToBaseline(i::Isolate* isolate,
++                                    i::DirectHandle<i::JSFunction> function) {
++  i::DirectHandle<i::SharedFunctionInfo> sfi(function->shared(), isolate);
++
++  if (!sfi->HasBytecodeArray()) {
++    i::IsCompiledScope compiled_scope(*sfi, isolate);
++    if (!i::Compiler::Compile(isolate, function,
++                              i::Compiler::CLEAR_EXCEPTION, &compiled_scope)) {
++      return false;
++    }
++  }
++
++  i::IsCompiledScope is_compiled(*sfi, isolate);
++  if (!i::Compiler::CompileBaseline(isolate, function,
++                                     i::Compiler::CLEAR_EXCEPTION,
++                                     &is_compiled)) {
++    return false;
++  }
++
++  return true;
 +}
 +
 +enum class FunctionValidationResult {
@@ -393,6 +422,73 @@
 +    scope_iterator->Advance();
 +  }
 +  return true;
++}
++
++// Helper to navigate to a specific scope index
++static std::unique_ptr<debug::ScopeIterator> GetScopeAtIndex(
++    Isolate* isolate, Local<Function> function, int scope_index) {
++  auto scope_iterator =
++      debug::ScopeIterator::CreateForFunction(isolate, function);
++  if (!scope_iterator) return nullptr;
++
++  int current_index = 0;
++  while (!scope_iterator->Done() && current_index < scope_index) {
++    scope_iterator->Advance();
++    current_index++;
++  }
++
++  if (scope_iterator->Done()) return nullptr;
++  return scope_iterator;
++}
++
++MaybeLocal<Value> GetScopeVariable(Isolate* isolate,
++                                    Local<Function> function,
++                                    int scope_index,
++                                    Local<String> name) {
++  auto scope_iterator = GetScopeAtIndex(isolate, function, scope_index);
++  if (!scope_iterator) return MaybeLocal<Value>();
++
++  Local<Object> scope_object = scope_iterator->GetObject();
++  Local<Context> context = isolate->GetCurrentContext();
++
++  return scope_object->Get(context, name);
++}
++
++bool SetScopeVariable(Isolate* isolate,
++                       Local<Function> function,
++                       int scope_index,
++                       Local<String> name,
++                       Local<Value> value) {
++  auto scope_iterator = GetScopeAtIndex(isolate, function, scope_index);
++  if (!scope_iterator) return false;
++
++  return scope_iterator->SetVariableValue(name, value);
++}
++
++MaybeLocal<Array> GetScopeVariableNames(Isolate* isolate,
++                                         Local<Function> function,
++                                         int scope_index) {
++  auto scope_iterator = GetScopeAtIndex(isolate, function, scope_index);
++  if (!scope_iterator) return MaybeLocal<Array>();
++
++  Local<Object> scope_object = scope_iterator->GetObject();
++  Local<Context> context = isolate->GetCurrentContext();
++
++  return scope_object->GetOwnPropertyNames(context);
++}
++
++bool HasScopeVariable(Isolate* isolate,
++                       Local<Function> function,
++                       int scope_index,
++                       Local<String> name) {
++  auto scope_iterator = GetScopeAtIndex(isolate, function, scope_index);
++  if (!scope_iterator) return false;
++
++  Local<Object> scope_object = scope_iterator->GetObject();
++  Local<Context> context = isolate->GetCurrentContext();
++
++  Maybe<bool> result = scope_object->Has(context, name);
++  return result.IsJust() && result.FromJust();
 +}
 +
 +MaybeLocal<Function> CloneFunction(Local<Context> context,
@@ -759,59 +855,62 @@
 +    return false;
 +  }
 +
-+  int identity_hash = target_handle->GetOrCreateIdentityHash(i_isolate).value();
-+  auto& hooked = GetHookedFunctions();
-+
-+  i::Tagged<i::BytecodeArray> target_bytecode =
-+      target_sfi_handle->GetBytecodeArray(i_isolate);
-+  i::Tagged<i::BytecodeArray> replacement_bytecode =
-+      replacement_sfi_handle->GetBytecodeArray(i_isolate);
-+
-+  if (hooked.find(identity_hash) == hooked.end()) {
-+    hooked[identity_hash] = target_bytecode.ptr();
++  if (!ForceCompileToBaseline(i_isolate, target_handle)) {
++    return false;
++  }
++  if (!ForceCompileToBaseline(i_isolate, replacement_handle)) {
++    return false;
 +  }
 +
-+  target_sfi_handle->SetActiveBytecodeArray(replacement_bytecode, i_isolate);
-+  target_handle->UpdateCode(i_isolate,
-+      *BUILTIN_CODE(i_isolate, InterpreterEntryTrampoline));
++  i::JSDispatchTable* jdt = i::IsolateGroup::current()->js_dispatch_table();
++  i::JSDispatchHandle target_dispatch = target_handle->dispatch_handle();
++  i::JSDispatchHandle replacement_dispatch = replacement_handle->dispatch_handle();
++  uint32_t handle_value = target_dispatch.value();
 +
-+  i::DirectHandle<i::FeedbackCell> new_feedback_cell = i_isolate->factory()->NewNoClosuresCell();
-+  target_handle->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++  auto& hooked = GetHookedFunctions();
++
++  if (hooked.find(handle_value) == hooked.end()) {
++    HookState state;
++    state.original_entrypoint = jdt->GetEntrypoint(target_dispatch);
++    state.original_context = target_handle->context().ptr();
++    state.original_feedback_cell = target_handle->raw_feedback_cell().ptr();
++    hooked[handle_value] = state;
++  }
++
++  i::Address replacement_entrypoint = jdt->GetEntrypoint(replacement_dispatch);
++  jdt->SetEntrypointOnly(target_dispatch, replacement_entrypoint);
++
++  target_handle->set_context(replacement_handle->context());
++  target_handle->set_raw_feedback_cell(
++      replacement_handle->raw_feedback_cell(),
++      i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
 +
 +  return true;
 +}
 +
 +bool RestoreFunction(Local<Context> context, Local<Function> target) {
-+  i::Isolate* i_isolate = i::Isolate::Current();
-+
 +  auto i_target = Utils::OpenDirectHandle(*target);
 +  if (!i::IsJSFunction(*i_target)) return false;
 +
 +  i::DirectHandle<i::JSFunction> target_handle = i::Cast<i::JSFunction>(i_target);
-+  int identity_hash = target_handle->GetOrCreateIdentityHash(i_isolate).value();
++  i::JSDispatchHandle dispatch_handle = target_handle->dispatch_handle();
++  uint32_t handle_value = dispatch_handle.value();
 +
 +  auto& hooked = GetHookedFunctions();
-+  auto it = hooked.find(identity_hash);
++  auto it = hooked.find(handle_value);
 +  if (it == hooked.end()) return false;
 +
-+  i::DirectHandle<i::SharedFunctionInfo> target_sfi_handle(target_handle->shared(), i_isolate);
++  i::JSDispatchTable* jdt = i::IsolateGroup::current()->js_dispatch_table();
++  jdt->SetEntrypointOnly(dispatch_handle, it->second.original_entrypoint);
 +
-+  i::Deoptimizer::DeoptimizeFunction(*target_handle, i::LazyDeoptimizeReason::kDebugger);
++  i::Tagged<i::Context> original_context =
++      i::Cast<i::Context>(i::Tagged<i::Object>(it->second.original_context));
++  target_handle->set_context(original_context);
 +
-+  if (target_sfi_handle->HasBaselineCode()) {
-+    target_sfi_handle->FlushBaselineCode();
-+  }
-+
-+  i::Tagged<i::BytecodeArray> original_bytecode =
-+      i::TrustedCast<i::BytecodeArray>(
-+          i::Tagged<i::Object>(i::Address(it->second)));
-+  target_sfi_handle->SetActiveBytecodeArray(original_bytecode, i_isolate);
-+
-+  target_handle->UpdateCode(i_isolate,
-+      *BUILTIN_CODE(i_isolate, InterpreterEntryTrampoline));
-+
-+  i::DirectHandle<i::FeedbackCell> new_feedback_cell = i_isolate->factory()->NewNoClosuresCell();
-+  target_handle->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++  i::Tagged<i::FeedbackCell> original_feedback_cell =
++      i::Cast<i::FeedbackCell>(i::Tagged<i::Object>(it->second.original_feedback_cell));
++  target_handle->set_raw_feedback_cell(original_feedback_cell,
++                                        i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
 +
 +  hooked.erase(it);
 +
@@ -819,22 +918,19 @@
 +}
 +
 +bool IsFunctionHooked(Local<Context> context, Local<Function> target) {
-+  i::Isolate* i_isolate = i::Isolate::Current();
-+
 +  auto i_target = Utils::OpenDirectHandle(*target);
 +  if (!i::IsJSFunction(*i_target)) return false;
 +
-+  i::Tagged<i::JSFunction> target_func = *i::Cast<i::JSFunction>(i_target);
-+  int identity_hash = target_func->GetOrCreateIdentityHash(i_isolate).value();
++  i::DirectHandle<i::JSFunction> target_handle = i::Cast<i::JSFunction>(i_target);
++  i::JSDispatchHandle dispatch_handle = target_handle->dispatch_handle();
++  uint32_t handle_value = dispatch_handle.value();
 +
 +  auto& hooked = GetHookedFunctions();
-+  return hooked.find(identity_hash) != hooked.end();
++  return hooked.find(handle_value) != hooked.end();
 +}
 +
 +bool SetProxyHandler(Local<Context> context, Local<Proxy> proxy,
 +                      Local<Object> new_handler) {
-+  i::Isolate* i_isolate = i::Isolate::Current();
-+
 +  auto i_proxy = Utils::OpenDirectHandle(*proxy);
 +  auto i_handler = Utils::OpenDirectHandle(*new_handler);
 +
@@ -1078,3 +1174,31 @@
 +
 +}  // namespace callisto
 +}  // namespace v8
+--- a/v8/src/sandbox/js-dispatch-table-inl.h
++++ b/v8/src/sandbox/js-dispatch-table-inl.h
+@@ -125,6 +125,14 @@ void JSDispatchTable::SetTieringRequest(
+       isolate->builtin_entry_table()[static_cast<uint32_t>(builtin)]);
+ }
+ 
++void JSDispatchTable::SetEntrypointOnly(JSDispatchHandle handle,
++                                        Address new_entrypoint) {
++  uint32_t index = HandleToIndex(handle);
++  DCHECK_GE(index, kEndOfReadOnlyIndex);
++  CFIMetadataWriteScope write_scope("JSDispatchTable SetEntrypointOnly");
++  at(index).SetEntrypointPointer(new_entrypoint);
++}
++
+ bool JSDispatchTable::IsTieringRequested(JSDispatchHandle handle) {
+   uint32_t index = HandleToIndex(handle);
+   DCHECK_GE(index, kEndOfReadOnlyIndex);
+--- a/v8/src/sandbox/js-dispatch-table.h
++++ b/v8/src/sandbox/js-dispatch-table.h
+@@ -224,6 +224,8 @@ class V8_EXPORT_PRIVATE JSDispatchTable
+   // pointer untouched and changes only the entrypoint.
+   inline void SetTieringRequest(JSDispatchHandle handle, TieringBuiltin builtin,
+                                 Isolate* isolate);
++
++  inline void SetEntrypointOnly(JSDispatchHandle handle, Address new_entrypoint);
+   inline void SetCodeKeepTieringRequestNoWriteBarrier(JSDispatchHandle handle,
+                                                       Tagged<Code> new_code);
+   // Resets the entrypoint to the code's entrypoint.
