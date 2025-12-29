@@ -10,7 +10,7 @@
      "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
 +++ b/v8/src/api/api-callisto.cc
-@@ -0,0 +1,1163 @@
+@@ -0,0 +1,1218 @@
 +// Internal implementation of Callisto API's
 +
 +#include "include/v8-callisto.h"
@@ -22,6 +22,7 @@
 +#include "include/v8-profiler.h"
 +#include "src/api/api-inl.h"
 +#include "src/builtins/builtins.h"
++#include "src/codegen/bailout-reason.h"
 +#include "src/codegen/compiler.h"
 +#include "src/debug/debug-interface.h"
 +#include "src/debug/debug-scope-iterator.h"
@@ -30,6 +31,7 @@
 +#include "src/interpreter/bytecode-array-iterator.h"
 +#include "src/interpreter/interpreter.h"
 +#include "src/objects/code-inl.h"
++#include "src/objects/feedback-vector-inl.h"
 +#include "src/objects/heap-object-inl.h"
 +#include "src/objects/js-function-inl.h"
 +#include "src/objects/js-proxy-inl.h"
@@ -45,6 +47,7 @@
 +
 +struct HookState {
 +  i::Address original_entrypoint;
++  i::Address original_code;
 +  i::Address original_context;
 +  i::Address original_feedback_cell;
 +};
@@ -531,8 +534,19 @@
 +
 +  new_func->UpdateCode(isolate, *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));
 +
-+  i::DirectHandle<i::FeedbackCell> new_feedback_cell = isolate->factory()->NewNoClosuresCell();
-+  new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++  i::IsCompiledScope is_compiled(*new_sfi, isolate);
++  if (is_compiled.is_compiled() && new_sfi->HasFeedbackMetadata()) {
++    i::JSFunction::EnsureFeedbackVector(isolate, new_func, &is_compiled);
++  } else {
++    i::DirectHandle<i::FeedbackCell> new_feedback_cell = isolate->factory()->NewNoClosuresCell();
++    new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++  }
++
++  if (!new_sfi->all_optimization_disabled()) {
++    new_sfi->DisableOptimization(isolate, i::BailoutReason::kNeverOptimize);
++  }
++  new_func->ResetTieringRequests();
++  new_func->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
 +
 +  return Utils::ToLocal(new_func);
 +}
@@ -808,8 +822,19 @@
 +
 +  new_func->UpdateCode(isolate, *BUILTIN_CODE(isolate, InterpreterEntryTrampoline));
 +
-+  i::DirectHandle<i::FeedbackCell> new_feedback_cell = isolate->factory()->NewNoClosuresCell();
-+  new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++  i::IsCompiledScope is_compiled(*new_sfi, isolate);
++  if (is_compiled.is_compiled() && new_sfi->HasFeedbackMetadata()) {
++    i::JSFunction::EnsureFeedbackVector(isolate, new_func, &is_compiled);
++  } else {
++    i::DirectHandle<i::FeedbackCell> new_feedback_cell = isolate->factory()->NewNoClosuresCell();
++    new_func->set_raw_feedback_cell(*new_feedback_cell, i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
++  }
++
++  if (!new_sfi->all_optimization_disabled()) {
++    new_sfi->DisableOptimization(isolate, i::BailoutReason::kNeverOptimize);
++  }
++  new_func->ResetTieringRequests();
++  new_func->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
 +
 +  return Utils::ToLocal(new_func);
 +}
@@ -862,6 +887,31 @@
 +    return false;
 +  }
 +
++  if (!target_sfi_handle->all_optimization_disabled()) {
++    target_sfi_handle->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
++  }
++  if (!replacement_sfi_handle->all_optimization_disabled()) {
++    replacement_sfi_handle->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
++  }
++
++  i::Deoptimizer::DeoptimizeFunction(*target_handle, i::LazyDeoptimizeReason::kDebugger);
++  i::Deoptimizer::DeoptimizeFunction(*replacement_handle, i::LazyDeoptimizeReason::kDebugger);
++
++  target_handle->ResetTieringRequests();
++  replacement_handle->ResetTieringRequests();
++
++  if (target_handle->has_feedback_vector()) {
++    target_handle->feedback_vector()->set_was_once_deoptimized();
++    target_handle->feedback_vector()->set_tiering_in_progress(false);
++  }
++  if (replacement_handle->has_feedback_vector()) {
++    replacement_handle->feedback_vector()->set_was_once_deoptimized();
++    replacement_handle->feedback_vector()->set_tiering_in_progress(false);
++  }
++
++  target_handle->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
++  replacement_handle->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
++
 +  i::JSDispatchTable* jdt = i::IsolateGroup::current()->js_dispatch_table();
 +  i::JSDispatchHandle target_dispatch = target_handle->dispatch_handle();
 +  i::JSDispatchHandle replacement_dispatch = replacement_handle->dispatch_handle();
@@ -872,13 +922,15 @@
 +  if (hooked.find(handle_value) == hooked.end()) {
 +    HookState state;
 +    state.original_entrypoint = jdt->GetEntrypoint(target_dispatch);
++    state.original_code = jdt->GetCodeAddress(target_dispatch);
 +    state.original_context = target_handle->context().ptr();
 +    state.original_feedback_cell = target_handle->raw_feedback_cell().ptr();
 +    hooked[handle_value] = state;
 +  }
 +
++  i::Tagged<i::Code> replacement_code = jdt->GetCode(replacement_dispatch);
 +  i::Address replacement_entrypoint = jdt->GetEntrypoint(replacement_dispatch);
-+  jdt->SetEntrypointOnly(target_dispatch, replacement_entrypoint);
++  jdt->SetCodeAndEntrypointNoWriteBarrier(target_dispatch, replacement_code, replacement_entrypoint);
 +
 +  target_handle->set_context(replacement_handle->context());
 +  target_handle->set_raw_feedback_cell(
@@ -901,7 +953,10 @@
 +  if (it == hooked.end()) return false;
 +
 +  i::JSDispatchTable* jdt = i::IsolateGroup::current()->js_dispatch_table();
-+  jdt->SetEntrypointOnly(dispatch_handle, it->second.original_entrypoint);
++  i::Tagged<i::Code> original_code =
++      i::TrustedCast<i::Code>(i::Tagged<i::Object>(it->second.original_code));
++  jdt->SetCodeAndEntrypointNoWriteBarrier(dispatch_handle, original_code,
++                                           it->second.original_entrypoint);
 +
 +  i::Tagged<i::Context> original_context =
 +      i::Cast<i::Context>(i::Tagged<i::Object>(it->second.original_context));
@@ -1174,31 +1229,27 @@
 +
 +}  // namespace callisto
 +}  // namespace v8
---- a/v8/src/sandbox/js-dispatch-table-inl.h
-+++ b/v8/src/sandbox/js-dispatch-table-inl.h
-@@ -125,6 +125,14 @@ void JSDispatchTable::SetTieringRequest(
-       isolate->builtin_entry_table()[static_cast<uint32_t>(builtin)]);
- }
- 
-+void JSDispatchTable::SetEntrypointOnly(JSDispatchHandle handle,
-+                                        Address new_entrypoint) {
-+  uint32_t index = HandleToIndex(handle);
-+  DCHECK_GE(index, kEndOfReadOnlyIndex);
-+  CFIMetadataWriteScope write_scope("JSDispatchTable SetEntrypointOnly");
-+  at(index).SetEntrypointPointer(new_entrypoint);
-+}
-+
- bool JSDispatchTable::IsTieringRequested(JSDispatchHandle handle) {
-   uint32_t index = HandleToIndex(handle);
-   DCHECK_GE(index, kEndOfReadOnlyIndex);
 --- a/v8/src/sandbox/js-dispatch-table.h
 +++ b/v8/src/sandbox/js-dispatch-table.h
-@@ -224,6 +224,8 @@ class V8_EXPORT_PRIVATE JSDispatchTable
+@@ -224,6 +224,10 @@ class V8_EXPORT_PRIVATE JSDispatchTable
    // pointer untouched and changes only the entrypoint.
    inline void SetTieringRequest(JSDispatchHandle handle, TieringBuiltin builtin,
                                  Isolate* isolate);
 +
-+  inline void SetEntrypointOnly(JSDispatchHandle handle, Address new_entrypoint);
++  inline void SetCodeAndEntrypointNoWriteBarrier(JSDispatchHandle handle,
++                                                 Tagged<Code> new_code,
++                                                 Address entrypoint);
    inline void SetCodeKeepTieringRequestNoWriteBarrier(JSDispatchHandle handle,
                                                        Tagged<Code> new_code);
    // Resets the entrypoint to the code's entrypoint.
+@@ -316,10 +320,6 @@ class V8_EXPORT_PRIVATE JSDispatchTable
+   static inline bool IsCompatibleCode(Tagged<Code> code,
+                                       uint16_t parameter_count);
+ 
+-  inline void SetCodeAndEntrypointNoWriteBarrier(JSDispatchHandle handle,
+-                                                 Tagged<Code> new_code,
+-                                                 Address entrypoint);
+-
+   static uint32_t HandleToIndex(JSDispatchHandle handle) {
+     uint32_t index = handle.value() >> kJSDispatchHandleShift;
+     DCHECK_EQ(handle.value(), index << kJSDispatchHandleShift);

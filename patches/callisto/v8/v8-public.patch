@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/v8/include/v8-callisto.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,126 @@
 +// Copyright 2024 the Callisto Browser authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -100,7 +100,8 @@
 +                                             Local<Object> data,
 +                                             Local<Function> template_func = Local<Function>());
 +
-+V8_EXPORT bool HookFunction(Local<Context> context, Local<Function> target,
++V8_EXPORT bool HookFunction(Local<Context> context,
++                            Local<Function> target,
 +                            Local<Function> replacement);
 +
 +V8_EXPORT bool RestoreFunction(Local<Context> context, Local<Function> target);
