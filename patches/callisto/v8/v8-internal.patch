@@ -10,7 +10,7 @@
      "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
 +++ b/v8/src/api/api-callisto.cc
-@@ -0,0 +1,1193 @@
+@@ -0,0 +1,1300 @@
 +#include "include/v8-callisto.h"
 +
 +#include <string>
@@ -18,6 +18,7 @@
 +#include <vector>
 +
 +#include "include/v8-profiler.h"
++#include "include/v8-template.h"
 +#include "src/api/api-inl.h"
 +#include "src/builtins/builtins.h"
 +#include "src/codegen/bailout-reason.h"
@@ -34,6 +35,7 @@
 +#include "src/objects/js-function-inl.h"
 +#include "src/objects/js-proxy-inl.h"
 +#include "src/objects/shared-function-info-inl.h"
++#include "src/objects/function-kind.h"
 +#include "src/sandbox/js-dispatch-table-inl.h"
 +
 +#ifdef GetObject
@@ -51,8 +53,9 @@
 +};
 +
 +static std::unordered_map<uint32_t, HookState>& GetHookedFunctions() {
-+  static std::unordered_map<uint32_t, HookState> hooked_functions;
-+  return hooked_functions;
++  static std::unordered_map<uint32_t, HookState>* hooked_functions =
++      new std::unordered_map<uint32_t, HookState>();
++  return *hooked_functions;
 +}
 +
 +static bool ForceCompileToBaseline(i::Isolate* isolate,
@@ -80,14 +83,12 @@
 +enum class FunctionValidationResult {
 +  kValid,
 +  kNotJSFunction,
-+  kBoundFunction,
 +  kBuiltinFunction,
 +  kNativeFunction,
 +  kApiFunction,
 +  kWasmFunction,
 +  kNotCompiled,
 +  kNoBytecode,
-+  kNoScript,
 +};
 +
 +static FunctionValidationResult ValidateFunctionForHooking(
@@ -163,8 +164,6 @@
 +      return FunctionStatus::kOk;
 +    case FunctionValidationResult::kNotJSFunction:
 +      return FunctionStatus::kNotFunction;
-+    case FunctionValidationResult::kBoundFunction:
-+      return FunctionStatus::kBoundFunction;
 +    case FunctionValidationResult::kBuiltinFunction:
 +      return FunctionStatus::kBuiltinFunction;
 +    case FunctionValidationResult::kNativeFunction:
@@ -176,8 +175,6 @@
 +    case FunctionValidationResult::kNotCompiled:
 +      return FunctionStatus::kNotCompiled;
 +    case FunctionValidationResult::kNoBytecode:
-+      return FunctionStatus::kNoBytecode;
-+    case FunctionValidationResult::kNoScript:
 +      return FunctionStatus::kNoBytecode;
 +  }
 +  return FunctionStatus::kNotFunction;
@@ -315,6 +312,31 @@
 +
 +  if (!EnsureFunctionCompiled(isolate, replacement_handle)) {
 +    return FunctionStatus::kNotCompiled;
++  }
++
++  i::DirectHandle<i::SharedFunctionInfo> target_sfi(target_handle->shared(), isolate);
++  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi(replacement_handle->shared(), isolate);
++
++  int target_params = target_sfi->internal_formal_parameter_count_without_receiver();
++  int replacement_params = replacement_sfi->internal_formal_parameter_count_without_receiver();
++
++  if (target_params != replacement_params) {
++    return FunctionStatus::kLengthMismatch;
++  }
++
++  i::FunctionKind target_kind = target_sfi->kind();
++  i::FunctionKind replacement_kind = replacement_sfi->kind();
++
++  if (i::IsGeneratorFunction(target_kind) != i::IsGeneratorFunction(replacement_kind)) {
++    return FunctionStatus::kGeneratorMismatch;
++  }
++
++  if (i::IsAsyncFunction(target_kind) != i::IsAsyncFunction(replacement_kind)) {
++    return FunctionStatus::kAsyncMismatch;
++  }
++
++  if (i::IsDerivedConstructor(target_kind) != i::IsDerivedConstructor(replacement_kind)) {
++    return FunctionStatus::kDerivedConstructorMismatch;
 +  }
 +
 +  return FunctionStatus::kOk;
@@ -851,6 +873,31 @@
 +    return false;
 +  }
 +
++  i::DirectHandle<i::SharedFunctionInfo> target_sfi(target_handle->shared(), i_isolate);
++  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi(replacement_handle->shared(), i_isolate);
++
++  int target_params = target_sfi->internal_formal_parameter_count_without_receiver();
++  int replacement_params = replacement_sfi->internal_formal_parameter_count_without_receiver();
++
++  if (target_params != replacement_params) {
++    return false;
++  }
++
++  i::FunctionKind target_kind = target_sfi->kind();
++  i::FunctionKind replacement_kind = replacement_sfi->kind();
++
++  if (i::IsGeneratorFunction(target_kind) != i::IsGeneratorFunction(replacement_kind)) {
++    return false;
++  }
++
++  if (i::IsAsyncFunction(target_kind) != i::IsAsyncFunction(replacement_kind)) {
++    return false;
++  }
++
++  if (i::IsDerivedConstructor(target_kind) != i::IsDerivedConstructor(replacement_kind)) {
++    return false;
++  }
++
 +  if (!ForceCompileToBaseline(i_isolate, target_handle)) {
 +    return false;
 +  }
@@ -859,14 +906,12 @@
 +    return false;
 +  }
 +
-+  i::DirectHandle<i::SharedFunctionInfo> target_sfi_handle(target_handle->shared(), i_isolate);
-+  if (!target_sfi_handle->all_optimization_disabled()) {
-+    target_sfi_handle->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
++  if (!target_sfi->all_optimization_disabled()) {
++    target_sfi->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
 +  }
 +
-+  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi_handle(replacement_handle->shared(), i_isolate);
-+  if (!replacement_sfi_handle->all_optimization_disabled()) {
-+    replacement_sfi_handle->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
++  if (!replacement_sfi->all_optimization_disabled()) {
++    replacement_sfi->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
 +  }
 +
 +  i::Deoptimizer::DeoptimizeFunction(*target_handle, i::LazyDeoptimizeReason::kDebugger);
@@ -1200,6 +1245,68 @@
 +      &it, i_value, attrs, Just(i::kDontThrow));
 +
 +  return result.IsJust() && result.FromJust();
++}
++
++static void WrapNativeCallback(const FunctionCallbackInfo<Value>& info) {
++  Isolate* isolate = info.GetIsolate();
++  Local<Context> context = isolate->GetCurrentContext();
++
++  Local<Value> data = info.Data();
++  if (!data->IsFunction()) {
++    isolate->ThrowError("WrapNative: internal error - wrapped function not found");
++    return;
++  }
++
++  Local<Function> wrapped = data.As<Function>();
++
++  int argc = info.Length();
++  std::vector<Local<Value>> argv(argc);
++  for (int i = 0; i < argc; i++) {
++    argv[i] = info[i];
++  }
++
++  Local<Value> receiver = info.This();
++
++  MaybeLocal<Value> result;
++  if (info.IsConstructCall()) {
++    result = wrapped->NewInstance(context, argc, argc > 0 ? argv.data() : nullptr);
++  } else {
++    result = wrapped->Call(context, receiver, argc, argc > 0 ? argv.data() : nullptr);
++  }
++
++  if (!result.IsEmpty()) {
++    info.GetReturnValue().Set(result.ToLocalChecked());
++  }
++}
++
++MaybeLocal<Function> WrapNative(Local<Context> context,
++                                 Local<Function> function) {
++  Isolate* isolate = reinterpret_cast<Isolate*>(i::Isolate::Current());
++
++  if (function.IsEmpty() || !function->IsFunction()) {
++    return MaybeLocal<Function>();
++  }
++
++  Local<FunctionTemplate> templ = FunctionTemplate::New(
++      isolate, WrapNativeCallback, function, Local<Signature>(), 0,
++      ConstructorBehavior::kThrow, SideEffectType::kHasSideEffect);
++
++  templ->RemovePrototype();
++
++  MaybeLocal<Function> maybe_wrapper = templ->GetFunction(context);
++
++  if (maybe_wrapper.IsEmpty()) {
++    return MaybeLocal<Function>();
++  }
++
++  Local<Function> wrapper = maybe_wrapper.ToLocalChecked();
++
++  Local<Value> name_val = function->GetName();
++  if (name_val->IsString()) {
++    wrapper->SetName(name_val.As<String>());
++  }
++
++  return wrapper;
 +}
 +
 +}  // namespace callisto

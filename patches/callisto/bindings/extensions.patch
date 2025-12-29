@@ -20,10 +20,11 @@
      "native_extension_bindings_system.cc",
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
-@@ -0,0 +1,1057 @@
+@@ -0,0 +1,1101 @@
 +#include "extensions/renderer/callisto_api.h"
 +
 +#include <cstring>
++#include <tuple>
 +
 +#include "extensions/renderer/script_context.h"
 +#include "gin/converter.h"
@@ -487,8 +488,6 @@
 +      return "only user-defined JavaScript functions are supported, builtin functions are not allowed";
 +    case v8::callisto::FunctionStatus::kNativeFunction:
 +      return "only user-defined JavaScript functions are supported, native functions are not allowed";
-+    case v8::callisto::FunctionStatus::kBoundFunction:
-+      return "only user-defined JavaScript functions are supported, bound functions are not allowed";
 +    case v8::callisto::FunctionStatus::kApiFunction:
 +      return "only user-defined JavaScript functions are supported, API functions are not allowed";
 +    case v8::callisto::FunctionStatus::kWasmFunction:
@@ -497,8 +496,14 @@
 +      return "function could not be compiled";
 +    case v8::callisto::FunctionStatus::kNoBytecode:
 +      return "function has no bytecode";
-+    case v8::callisto::FunctionStatus::kKindMismatch:
-+      return "target and replacement function kinds must match";
++    case v8::callisto::FunctionStatus::kLengthMismatch:
++      return "target and replacement functions must have the same number of parameters";
++    case v8::callisto::FunctionStatus::kGeneratorMismatch:
++      return "cannot hook generator function with non-generator or vice versa";
++    case v8::callisto::FunctionStatus::kAsyncMismatch:
++      return "cannot hook async function with non-async or vice versa";
++    case v8::callisto::FunctionStatus::kDerivedConstructorMismatch:
++      return "cannot hook derived constructor with base constructor or vice versa";
 +  }
 +  return "unknown error";
 +}
@@ -631,6 +636,12 @@
 +
 +  v8::Local<v8::Function> target = info[0].As<v8::Function>();
 +
++  if (v8::callisto::IsFunctionHooked(context, target)) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.clone: cannot clone a hooked function")));
++    return;
++  }
++
 +  v8::callisto::FunctionStatus status =
 +      v8::callisto::ValidateFunction(context, target);
 +
@@ -743,6 +754,38 @@
 +  }
 +
 +  info.GetReturnValue().Set(maybe_func.ToLocalChecked());
++}
++
++void CallistoAPI::WrapNative(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.wrapNative requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.wrapNative: argument is not a function")));
++    return;
++  }
++
++  v8::Local<v8::Function> target = info[0].As<v8::Function>();
++
++  v8::MaybeLocal<v8::Function> maybe_wrapper =
++      v8::callisto::WrapNative(context, target);
++
++  if (maybe_wrapper.IsEmpty()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.functions.wrapNative: failed to wrap function")));
++    return;
++  }
++
++  info.GetReturnValue().Set(maybe_wrapper.ToLocalChecked());
 +}
 +
 +void CallistoAPI::PatchProxy(
@@ -963,7 +1006,7 @@
 +    if (static_cast<int>(attr) >= 0) {
 +      property_exists = true;
 +      current_attrs = attr;
-+      target->Get(context, key).ToLocal(&current_value);
++      std::ignore = target->Get(context, key).ToLocal(&current_value);
 +    }
 +  }
 +
@@ -1048,6 +1091,7 @@
 +  set_method(functions, "clone", CloneFunction);
 +  set_method(functions, "dump", Dump);
 +  set_method(functions, "build", Build);
++  set_method(functions, "wrapNative", WrapNative);
 +  callisto->Set(v8_context, gin::StringToV8(isolate, "functions"), functions).Check();
 +
 +  v8::Local<v8::Object> proxies = v8::Object::New(isolate);
@@ -1080,7 +1124,7 @@
 +}  // namespace extensions
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,42 @@
 +#ifndef EXTENSIONS_RENDERER_CALLISTO_API_H_
 +#define EXTENSIONS_RENDERER_CALLISTO_API_H_
 +
@@ -1107,6 +1151,7 @@
 +  static void CloneFunction(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void Dump(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void Build(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void WrapNative(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void PatchProxy(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void UnwrapProxy(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void IsProxy(const v8::FunctionCallbackInfo<v8::Value>& info);
