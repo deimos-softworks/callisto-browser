@@ -23,5 +23,5 @@ ungoogled-chromium/windows/windows-fix-remove-unused-preferences-fields.patch
 ungoogled-chromium/windows/windows-fix-missing-includes.patch
 callisto/v8/v8-public.patch
 callisto/v8/v8-internal.patch
-callisto/v8/extension-bindings.patch
+callisto/bindings/extensions.patch
 callisto/branding/chrome-uach.patch
