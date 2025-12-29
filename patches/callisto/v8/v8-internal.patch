@@ -10,11 +10,12 @@
      "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
 +++ b/v8/src/api/api-callisto.cc
-@@ -0,0 +1,1300 @@
+@@ -0,0 +1,1352 @@
 +#include "include/v8-callisto.h"
 +
 +#include <string>
 +#include <unordered_map>
++#include <unordered_set>
 +#include <vector>
 +
 +#include "include/v8-profiler.h"
@@ -26,6 +27,7 @@
 +#include "src/debug/debug-interface.h"
 +#include "src/debug/debug-scope-iterator.h"
 +#include "src/deoptimizer/deoptimizer.h"
++#include "src/execution/frames-inl.h"
 +#include "src/init/isolate-group.h"
 +#include "src/interpreter/bytecode-array-iterator.h"
 +#include "src/interpreter/interpreter.h"
@@ -56,6 +58,12 @@
 +  static std::unordered_map<uint32_t, HookState>* hooked_functions =
 +      new std::unordered_map<uint32_t, HookState>();
 +  return *hooked_functions;
++}
++
++static std::unordered_set<uint32_t>& GetHiddenFromStackTraceFunctions() {
++  static std::unordered_set<uint32_t>* hidden_functions =
++      new std::unordered_set<uint32_t>();
++  return *hidden_functions;
 +}
 +
 +static bool ForceCompileToBaseline(i::Isolate* isolate,
@@ -1309,8 +1317,75 @@
 +  return wrapper;
 +}
 +
++MaybeLocal<Value> SafeApply(Local<Context> context,
++                            Local<Function> function,
++                            Local<Value> receiver,
++                            int argc,
++                            Local<Value> argv[]) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++
++  if (function.IsEmpty() || !function->IsFunction()) {
++    return MaybeLocal<Value>();
++  }
++
++  uint32_t caller_handle_value = 0;
++  bool found_caller = false;
++
++  {
++    i::JavaScriptStackFrameIterator it(i_isolate);
++    if (!it.done()) {
++      i::Tagged<i::JSFunction> caller_func = it.frame()->function();
++      if (i::IsJSFunction(caller_func)) {
++        i::JSDispatchHandle dispatch_handle = caller_func->dispatch_handle();
++        caller_handle_value = dispatch_handle.value();
++        found_caller = true;
++      }
++    }
++  }
++
++  if (found_caller) {
++    GetHiddenFromStackTraceFunctions().insert(caller_handle_value);
++  }
++
++  MaybeLocal<Value> result = function->Call(context, receiver, argc, argv);
++
++  if (found_caller) {
++    GetHiddenFromStackTraceFunctions().erase(caller_handle_value);
++  }
++
++  return result;
++}
++
 +}  // namespace callisto
 +}  // namespace v8
++
++// Callisto C externs (called from isolate.cc)
++extern "C" bool Callisto_IsFunctionHiddenFromStackTrace(uint32_t dispatch_handle_value) {
++  return v8::callisto::GetHiddenFromStackTraceFunctions().count(dispatch_handle_value) > 0;
++}
+--- a/v8/src/execution/isolate.cc
++++ b/v8/src/execution/isolate.cc
+@@ -783,6 +783,8 @@ StackTraceFailureMessage::StackTraceFail
+ 
+ bool NoExtension(const v8::FunctionCallbackInfo<v8::Value>&) { return false; }
+ 
++extern "C" bool Callisto_IsFunctionHiddenFromStackTrace(uint32_t dispatch_handle_value);
++
+ namespace {
+ 
+ bool IsBuiltinFunction(Isolate* isolate, Tagged<HeapObject> object,
+@@ -1098,6 +1100,11 @@ class CallSiteBuilder {
+   }
+ 
+   bool IsNotHidden(DirectHandle<JSFunction> function) {
++    JSDispatchHandle dispatch_handle = function->dispatch_handle();
++    if (Callisto_IsFunctionHiddenFromStackTrace(dispatch_handle.value())) {
++      return false;
++    }
++
+     // TODO(szuend): Remove this check once the flag is enabled
+     //               by default.
+     if (!v8_flags.experimental_stack_trace_frames &&
 --- a/v8/src/sandbox/js-dispatch-table.h
 +++ b/v8/src/sandbox/js-dispatch-table.h
 @@ -224,6 +224,10 @@ class V8_EXPORT_PRIVATE JSDispatchTable

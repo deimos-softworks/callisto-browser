@@ -20,7 +20,7 @@
      "native_extension_bindings_system.cc",
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
-@@ -0,0 +1,1101 @@
+@@ -0,0 +1,1159 @@
 +#include "extensions/renderer/callisto_api.h"
 +
 +#include <cstring>
@@ -944,6 +944,63 @@
 +  info.GetReturnValue().Set(success);
 +}
 +
++void CallistoAPI::SafeApply(
++    const v8::FunctionCallbackInfo<v8::Value>& info) {
++  v8::Isolate* isolate = info.GetIsolate();
++  v8::HandleScope handle_scope(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++
++  if (info.Length() < 1) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.safeApply requires 1 argument")));
++    return;
++  }
++
++  if (!info[0]->IsFunction()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.safeApply: argument is not a function")));
++    return;
++  }
++
++  v8::Local<v8::Function> target = info[0].As<v8::Function>();
++
++  v8::Local<v8::Value> receiver = v8::Undefined(isolate);
++  if (info.Length() >= 2) {
++    receiver = info[1];
++    if (receiver->IsNull() || receiver->IsUndefined()) {
++      receiver = v8::Undefined(isolate);
++    }
++  }
++
++  std::vector<v8::Local<v8::Value>> args;
++  if (info.Length() >= 3 && info[2]->IsArray()) {
++    v8::Local<v8::Array> args_array = info[2].As<v8::Array>();
++    uint32_t len = args_array->Length();
++    args.reserve(len);
++    for (uint32_t i = 0; i < len; ++i) {
++      v8::Local<v8::Value> arg;
++      if (args_array->Get(context, i).ToLocal(&arg)) {
++        args.push_back(arg);
++      } else {
++        args.push_back(v8::Undefined(isolate));
++      }
++    }
++  } else if (info.Length() >= 3 && !info[2]->IsNullOrUndefined()) {
++    isolate->ThrowException(v8::Exception::TypeError(
++        gin::StringToV8(isolate, "Callisto.safeApply: third argument is not an array")));
++    return;
++  }
++
++  v8::MaybeLocal<v8::Value> result = v8::callisto::SafeApply(
++      context, target, receiver,
++      static_cast<int>(args.size()),
++      args.empty() ? nullptr : args.data());
++
++  if (!result.IsEmpty()) {
++    info.GetReturnValue().Set(result.ToLocalChecked());
++  }
++}
++
 +void CallistoAPI::OverwriteProperty(
 +    const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
@@ -1083,6 +1140,7 @@
 +
 +  set_method(callisto, "queryObjects", QueryObjects);
 +  set_method(callisto, "dumpScopes", DumpScopes);
++  set_method(callisto, "safeApply", SafeApply);
 +
 +  v8::Local<v8::Object> functions = v8::Object::New(isolate);
 +  set_method(functions, "hook", HookFunction);
@@ -1124,7 +1182,7 @@
 +}  // namespace extensions
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.h
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,43 @@
 +#ifndef EXTENSIONS_RENDERER_CALLISTO_API_H_
 +#define EXTENSIONS_RENDERER_CALLISTO_API_H_
 +
@@ -1145,6 +1203,7 @@
 + private:
 +  static void QueryObjects(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void DumpScopes(const v8::FunctionCallbackInfo<v8::Value>& info);
++  static void SafeApply(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void HookFunction(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void RestoreFunction(const v8::FunctionCallbackInfo<v8::Value>& info);
 +  static void IsFunctionHooked(const v8::FunctionCallbackInfo<v8::Value>& info);
