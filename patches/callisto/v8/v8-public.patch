@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/v8/include/v8-callisto.h
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,125 @@
 +// Copyright 2024 the Callisto Browser authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -69,7 +69,6 @@
 +V8_EXPORT bool GetFunctionScopes(Isolate* isolate, Local<Function> function,
 +                                 std::vector<ScopeInfo>* scopes);
 +
-+// Live scope variable access - allows reading/writing scope variables by index
 +V8_EXPORT MaybeLocal<Value> GetScopeVariable(Isolate* isolate,
 +                                              Local<Function> function,
 +                                              int scope_index,

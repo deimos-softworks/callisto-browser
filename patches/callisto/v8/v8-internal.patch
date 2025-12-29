@@ -10,9 +10,7 @@
      "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
 +++ b/v8/src/api/api-callisto.cc
-@@ -0,0 +1,1218 @@
-+// Internal implementation of Callisto API's
-+
+@@ -0,0 +1,1193 @@
 +#include "include/v8-callisto.h"
 +
 +#include <string>
@@ -136,18 +134,6 @@
 +  }
 +
 +  return FunctionValidationResult::kValid;
-+}
-+
-+static bool FunctionKindsCompatible(i::FunctionKind a, i::FunctionKind b) {
-+  bool a_generator = i::IsGeneratorFunction(a) || i::IsAsyncGeneratorFunction(a);
-+  bool b_generator = i::IsGeneratorFunction(b) || i::IsAsyncGeneratorFunction(b);
-+  if (a_generator != b_generator) return false;
-+
-+  bool a_async = i::IsAsyncFunction(a) || i::IsAsyncGeneratorFunction(a);
-+  bool b_async = i::IsAsyncFunction(b) || i::IsAsyncGeneratorFunction(b);
-+  if (a_async != b_async) return false;
-+
-+  return true;
 +}
 +
 +static bool EnsureFunctionCompiled(i::Isolate* isolate,
@@ -274,8 +260,6 @@
 +  return i::FunctionKind::kNormalFunction;
 +}
 +
-+// Public API implementations
-+
 +FunctionStatus ValidateFunction(Local<Context> context,
 +                                Local<Function> function) {
 +  i::Isolate* isolate = i::Isolate::Current();
@@ -289,9 +273,10 @@
 +    if (!EnsureFunctionCompiled(isolate, js_func)) {
 +      return FunctionStatus::kNotCompiled;
 +    }
-+    return FunctionStatus::kOk;
++  } else if (result != FunctionValidationResult::kValid) {
++    return ToPublicStatus(result);
 +  }
-+  return ToPublicStatus(result);
++  return FunctionStatus::kOk;
 +}
 +
 +FunctionStatus ValidateFunctionPair(Local<Context> context,
@@ -327,15 +312,9 @@
 +  if (!EnsureFunctionCompiled(isolate, target_handle)) {
 +    return FunctionStatus::kNotCompiled;
 +  }
++
 +  if (!EnsureFunctionCompiled(isolate, replacement_handle)) {
 +    return FunctionStatus::kNotCompiled;
-+  }
-+
-+  i::DirectHandle<i::SharedFunctionInfo> target_sfi(target_handle->shared(), isolate);
-+  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi(replacement_handle->shared(), isolate);
-+
-+  if (!FunctionKindsCompatible(target_sfi->kind(), replacement_sfi->kind())) {
-+    return FunctionStatus::kKindMismatch;
 +  }
 +
 +  return FunctionStatus::kOk;
@@ -427,7 +406,6 @@
 +  return true;
 +}
 +
-+// Helper to navigate to a specific scope index
 +static std::unique_ptr<debug::ScopeIterator> GetScopeAtIndex(
 +    Isolate* isolate, Local<Function> function, int scope_index) {
 +  auto scope_iterator =
@@ -873,43 +851,38 @@
 +    return false;
 +  }
 +
-+  i::DirectHandle<i::SharedFunctionInfo> target_sfi_handle(target_handle->shared(), i_isolate);
-+  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi_handle(replacement_handle->shared(), i_isolate);
-+
-+  if (!FunctionKindsCompatible(target_sfi_handle->kind(), replacement_sfi_handle->kind())) {
-+    return false;
-+  }
-+
 +  if (!ForceCompileToBaseline(i_isolate, target_handle)) {
 +    return false;
 +  }
++
 +  if (!ForceCompileToBaseline(i_isolate, replacement_handle)) {
 +    return false;
 +  }
 +
++  i::DirectHandle<i::SharedFunctionInfo> target_sfi_handle(target_handle->shared(), i_isolate);
 +  if (!target_sfi_handle->all_optimization_disabled()) {
 +    target_sfi_handle->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
 +  }
++
++  i::DirectHandle<i::SharedFunctionInfo> replacement_sfi_handle(replacement_handle->shared(), i_isolate);
 +  if (!replacement_sfi_handle->all_optimization_disabled()) {
 +    replacement_sfi_handle->DisableOptimization(i_isolate, i::BailoutReason::kNeverOptimize);
 +  }
 +
 +  i::Deoptimizer::DeoptimizeFunction(*target_handle, i::LazyDeoptimizeReason::kDebugger);
-+  i::Deoptimizer::DeoptimizeFunction(*replacement_handle, i::LazyDeoptimizeReason::kDebugger);
-+
 +  target_handle->ResetTieringRequests();
-+  replacement_handle->ResetTieringRequests();
-+
 +  if (target_handle->has_feedback_vector()) {
 +    target_handle->feedback_vector()->set_was_once_deoptimized();
 +    target_handle->feedback_vector()->set_tiering_in_progress(false);
 +  }
++  target_handle->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
++
++  i::Deoptimizer::DeoptimizeFunction(*replacement_handle, i::LazyDeoptimizeReason::kDebugger);
++  replacement_handle->ResetTieringRequests();
 +  if (replacement_handle->has_feedback_vector()) {
 +    replacement_handle->feedback_vector()->set_was_once_deoptimized();
 +    replacement_handle->feedback_vector()->set_tiering_in_progress(false);
 +  }
-+
-+  target_handle->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
 +  replacement_handle->raw_feedback_cell()->set_interrupt_budget(INT32_MAX / 2);
 +
 +  i::JSDispatchTable* jdt = i::IsolateGroup::current()->js_dispatch_table();
@@ -952,18 +925,20 @@
 +  auto it = hooked.find(handle_value);
 +  if (it == hooked.end()) return false;
 +
++  const HookState& state = it->second;
++
 +  i::JSDispatchTable* jdt = i::IsolateGroup::current()->js_dispatch_table();
 +  i::Tagged<i::Code> original_code =
-+      i::TrustedCast<i::Code>(i::Tagged<i::Object>(it->second.original_code));
++      i::TrustedCast<i::Code>(i::Tagged<i::Object>(state.original_code));
 +  jdt->SetCodeAndEntrypointNoWriteBarrier(dispatch_handle, original_code,
-+                                           it->second.original_entrypoint);
++                                           state.original_entrypoint);
 +
 +  i::Tagged<i::Context> original_context =
-+      i::Cast<i::Context>(i::Tagged<i::Object>(it->second.original_context));
++      i::Cast<i::Context>(i::Tagged<i::Object>(state.original_context));
 +  target_handle->set_context(original_context);
 +
 +  i::Tagged<i::FeedbackCell> original_feedback_cell =
-+      i::Cast<i::FeedbackCell>(i::Tagged<i::Object>(it->second.original_feedback_cell));
++      i::Cast<i::FeedbackCell>(i::Tagged<i::Object>(state.original_feedback_cell));
 +  target_handle->set_raw_feedback_cell(original_feedback_cell,
 +                                        i::WriteBarrierMode::UPDATE_WRITE_BARRIER);
 +

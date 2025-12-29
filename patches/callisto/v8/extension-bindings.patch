@@ -20,7 +20,7 @@
      "native_extension_bindings_system.cc",
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
-@@ -0,0 +1,1074 @@
+@@ -0,0 +1,1057 @@
 +#include "extensions/renderer/callisto_api.h"
 +
 +#include <cstring>
@@ -73,7 +73,6 @@
 +  }
 +}
 +
-+// Helper to extract function and scope index from a LiveScope proxy handler
 +bool GetLiveScopeData(v8::Isolate* isolate,
 +                      v8::Local<v8::Object> handler,
 +                      v8::Local<v8::Function>* out_function,
@@ -102,7 +101,6 @@
 +  return true;
 +}
 +
-+// LiveScope proxy trap: get
 +void LiveScopeTrapGet(const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
 +  v8::HandleScope handle_scope(isolate);
@@ -115,14 +113,12 @@
 +
 +  v8::Local<v8::Value> property = info[1];
 +
-+  // Handle Symbol.toStringTag for nice console output
 +  if (property->IsSymbol()) {
 +    v8::Local<v8::Symbol> sym = property.As<v8::Symbol>();
 +    v8::Local<v8::Value> desc = sym->Description(isolate);
 +    if (desc->IsString()) {
 +      v8::String::Utf8Value utf8(isolate, desc);
 +      if (strcmp(*utf8, "Symbol.toStringTag") == 0) {
-+        // Get scope type from handler
 +        v8::Local<v8::Object> handler = info.This().As<v8::Object>();
 +        v8::Local<v8::Private> type_key = v8::Private::ForApi(
 +            isolate, gin::StringToV8(isolate, kLiveScopeTypeKey).As<v8::String>());
@@ -165,7 +161,6 @@
 +  info.GetReturnValue().Set(result.ToLocalChecked());
 +}
 +
-+// LiveScope proxy trap: set
 +void LiveScopeTrapSet(const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
 +  v8::HandleScope handle_scope(isolate);
@@ -199,7 +194,6 @@
 +  info.GetReturnValue().Set(success);
 +}
 +
-+// LiveScope proxy trap: has
 +void LiveScopeTrapHas(const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
 +  v8::HandleScope handle_scope(isolate);
@@ -231,7 +225,6 @@
 +  info.GetReturnValue().Set(has);
 +}
 +
-+// LiveScope proxy trap: ownKeys
 +void LiveScopeTrapOwnKeys(const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
 +  v8::HandleScope handle_scope(isolate);
@@ -256,7 +249,6 @@
 +  info.GetReturnValue().Set(result.ToLocalChecked());
 +}
 +
-+// LiveScope proxy trap: getOwnPropertyDescriptor
 +void LiveScopeTrapGetOwnPropertyDescriptor(
 +    const v8::FunctionCallbackInfo<v8::Value>& info) {
 +  v8::Isolate* isolate = info.GetIsolate();
@@ -312,7 +304,6 @@
 +  info.GetReturnValue().Set(descriptor);
 +}
 +
-+// Create a LiveScope proxy for a function and scope index
 +v8::Local<v8::Proxy> CreateLiveScopeProxy(
 +    v8::Isolate* isolate,
 +    v8::Local<v8::Context> context,
@@ -320,7 +311,6 @@
 +    int scope_index,
 +    v8::callisto::ScopeInfo::Type scope_type,
 +    v8::Local<v8::Object> scope_snapshot) {
-+  // Create handler object with trapped methods
 +  v8::Local<v8::Object> handler = v8::Object::New(isolate);
 +
 +  auto set_trap = [&](const char* name, v8::FunctionCallback callback) {
@@ -335,7 +325,6 @@
 +  set_trap("ownKeys", LiveScopeTrapOwnKeys);
 +  set_trap("getOwnPropertyDescriptor", LiveScopeTrapGetOwnPropertyDescriptor);
 +
-+  // Store function and scope index in handler's private fields
 +  v8::Local<v8::Private> func_key = v8::Private::ForApi(
 +      isolate, gin::StringToV8(isolate, kLiveScopeFunctionKey).As<v8::String>());
 +  v8::Local<v8::Private> idx_key = v8::Private::ForApi(
@@ -346,15 +335,12 @@
 +  handler->SetPrivate(context, func_key, function).Check();
 +  handler->SetPrivate(context, idx_key, v8::Integer::New(isolate, scope_index)).Check();
 +
-+  // Store scope type name for toStringTag
 +  std::string type_name = "LiveScope<";
 +  type_name += ScopeTypeToString(scope_type);
 +  type_name += ">";
 +  handler->SetPrivate(context, type_key,
 +                      gin::StringToV8(isolate, type_name)).Check();
 +
-+  // Use the scope snapshot as target so DevTools can display the variables
-+  // The proxy traps still handle all actual get/set for live behavior
 +  return v8::Proxy::New(context, scope_snapshot, handler).ToLocalChecked();
 +}
 +
@@ -467,14 +453,11 @@
 +
 +  v8::Local<v8::Object> result = v8::Object::New(isolate);
 +
-+  // Track scope index for each type separately isn't needed - we use global index
 +  int scope_index = 0;
 +  for (const auto& scope : scopes) {
 +    const char* type_name = ScopeTypeToString(scope.type);
 +    v8::Local<v8::String> type_key = gin::StringToV8(isolate, type_name).As<v8::String>();
 +
-+    // Create a LiveScope proxy for this scope, using the snapshot as target
-+    // so DevTools can display the variables while traps handle live access
 +    v8::Local<v8::Proxy> live_scope =
 +        CreateLiveScopeProxy(isolate, context, func, scope_index, scope.type, scope.object);
 +
@@ -501,15 +484,15 @@
 +    case v8::callisto::FunctionStatus::kNotFunction:
 +      return "argument is not a function";
 +    case v8::callisto::FunctionStatus::kBuiltinFunction:
-+      return "native builtin functions are not supported";
++      return "only user-defined JavaScript functions are supported, builtin functions are not allowed";
 +    case v8::callisto::FunctionStatus::kNativeFunction:
-+      return "native functions are not supported";
++      return "only user-defined JavaScript functions are supported, native functions are not allowed";
 +    case v8::callisto::FunctionStatus::kBoundFunction:
-+      return "bound functions are not supported";
++      return "only user-defined JavaScript functions are supported, bound functions are not allowed";
 +    case v8::callisto::FunctionStatus::kApiFunction:
-+      return "native API functions are not supported";
++      return "only user-defined JavaScript functions are supported, API functions are not allowed";
 +    case v8::callisto::FunctionStatus::kWasmFunction:
-+      return "WebAssembly functions are not supported";
++      return "only user-defined JavaScript functions are supported, WebAssembly functions are not allowed";
 +    case v8::callisto::FunctionStatus::kNotCompiled:
 +      return "function could not be compiled";
 +    case v8::callisto::FunctionStatus::kNoBytecode:
