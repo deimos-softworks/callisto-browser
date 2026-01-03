@@ -10,7 +10,7 @@
      "src/ast/ast-function-literal-id-reindexer.cc",
 --- /dev/null
 +++ b/v8/src/api/api-callisto.cc
-@@ -0,0 +1,1352 @@
+@@ -0,0 +1,1374 @@
 +#include "include/v8-callisto.h"
 +
 +#include <string>
@@ -35,6 +35,7 @@
 +#include "src/objects/feedback-vector-inl.h"
 +#include "src/objects/heap-object-inl.h"
 +#include "src/objects/js-function-inl.h"
++#include "src/objects/js-objects-inl.h"
 +#include "src/objects/js-proxy-inl.h"
 +#include "src/objects/shared-function-info-inl.h"
 +#include "src/objects/function-kind.h"
@@ -1288,18 +1289,25 @@
 +}
 +
 +MaybeLocal<Function> WrapNative(Local<Context> context,
-+                                 Local<Function> function) {
-+  Isolate* isolate = reinterpret_cast<Isolate*>(i::Isolate::Current());
++                                 Local<Function> function,
++                                 Local<String> name) {
++  i::Isolate* i_isolate = i::Isolate::Current();
++  Isolate* isolate = reinterpret_cast<Isolate*>(i_isolate);
 +
 +  if (function.IsEmpty() || !function->IsFunction()) {
 +    return MaybeLocal<Function>();
 +  }
 +
-+  Local<FunctionTemplate> templ = FunctionTemplate::New(
-+      isolate, WrapNativeCallback, function, Local<Signature>(), 0,
-+      ConstructorBehavior::kThrow, SideEffectType::kHasSideEffect);
++  int length = 0;
++  Local<String> length_str = String::NewFromUtf8Literal(isolate, "length");
++  Local<Value> length_val;
++  if (function->Get(context, length_str).ToLocal(&length_val) && length_val->IsInt32()) {
++    length = length_val.As<Int32>()->Value();
++  }
 +
-+  templ->RemovePrototype();
++  Local<FunctionTemplate> templ = FunctionTemplate::New(
++      isolate, WrapNativeCallback, function, Local<Signature>(), length,
++      ConstructorBehavior::kThrow, SideEffectType::kHasSideEffect);
 +
 +  MaybeLocal<Function> maybe_wrapper = templ->GetFunction(context);
 +
@@ -1309,9 +1317,23 @@
 +
 +  Local<Function> wrapper = maybe_wrapper.ToLocalChecked();
 +
-+  Local<Value> name_val = function->GetName();
-+  if (name_val->IsString()) {
-+    wrapper->SetName(name_val.As<String>());
++  i::DirectHandle<i::JSFunction> i_wrapper =
++      i::Cast<i::JSFunction>(Utils::OpenDirectHandle(*wrapper));
++  i::DirectHandle<i::JSFunction> i_original =
++      i::Cast<i::JSFunction>(Utils::OpenDirectHandle(*function));
++  i::Tagged<i::HeapObject> original_proto = i_original->map()->prototype();
++  if (i::IsJSReceiver(original_proto)) {
++    i::DirectHandle<i::JSReceiver> proto_handle(i::Cast<i::JSReceiver>(original_proto), i_isolate);
++    i::JSObject::ForceSetPrototype(i_isolate, i::Cast<i::JSObject>(i_wrapper), proto_handle);
++  }
++
++  if (!name.IsEmpty()) {
++    wrapper->SetName(name);
++  } else {
++    Local<Value> name_val = function->GetName();
++    if (name_val->IsString()) {
++      wrapper->SetName(name_val.As<String>());
++    }
 +  }
 +
 +  return wrapper;

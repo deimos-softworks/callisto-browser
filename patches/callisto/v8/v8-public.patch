@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/v8/include/v8-callisto.h
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,137 @@
 +// Copyright 2024 the Callisto Browser authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -126,7 +126,8 @@
 +                                 PropertyAttribute attributes);
 +
 +V8_EXPORT MaybeLocal<Function> WrapNative(Local<Context> context,
-+                                          Local<Function> function);
++                                          Local<Function> function,
++                                          Local<String> name = Local<String>());
 +
 +V8_EXPORT MaybeLocal<Value> SafeApply(Local<Context> context,
 +                                      Local<Function> function,
