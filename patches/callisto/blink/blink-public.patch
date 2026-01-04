@@ -1,0 +1,55 @@
+--- a/third_party/blink/public/BUILD.gn
++++ b/third_party/blink/public/BUILD.gn
+@@ -285,6 +285,7 @@ source_set("blink_headers") {
+     "web/web_ax_object.h",
+     "web/web_blob.h",
+     "web/web_bundled_code_cache_generator.h",
++    "web/web_callisto.h",
+     "web/web_console_message.h",
+     "web/web_content_capture_client.h",
+     "web/web_content_extraction.h",
+--- /dev/null
++++ b/third_party/blink/public/web/web_callisto.h
+@@ -0,0 +1,42 @@
++#ifndef THIRD_PARTY_BLINK_PUBLIC_WEB_WEB_CALLISTO_H_
++#define THIRD_PARTY_BLINK_PUBLIC_WEB_WEB_CALLISTO_H_
++
++#include <vector>
++
++#include "third_party/blink/public/platform/web_common.h"
++#include "third_party/blink/public/platform/web_string.h"
++#include "v8/include/v8-forward.h"
++
++namespace blink {
++
++struct BLINK_EXPORT WebEventListenerInfo {
++  WebEventListenerInfo();
++  WebEventListenerInfo(const WebEventListenerInfo&);
++  WebEventListenerInfo& operator=(const WebEventListenerInfo&);
++  ~WebEventListenerInfo();
++
++  WebString type;
++  bool use_capture = false;
++  bool passive = false;
++  bool once = false;
++  v8::Local<v8::Object> handler;
++  v8::Local<v8::Function> listener;
++  int script_id = 0;
++  int line_number = 0;
++  int column_number = 0;
++};
++
++class BLINK_EXPORT WebCallisto {
++ public:
++  static std::vector<WebEventListenerInfo> GetEventListeners(
++      v8::Isolate* isolate,
++      v8::Local<v8::Context> context,
++      v8::Local<v8::Value> object);
++
++ private:
++  WebCallisto() = delete;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_PUBLIC_WEB_WEB_CALLISTO_H_

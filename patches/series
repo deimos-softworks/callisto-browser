@@ -26,3 +26,5 @@ callisto/v8/v8-internal.patch
 callisto/bindings/extensions.patch
 callisto/branding/chrome-uach.patch
 callisto/extensions/remove-isolated-csp.patch
+callisto/blink/blink-public.patch
+callisto/blink/blink-internal.patch

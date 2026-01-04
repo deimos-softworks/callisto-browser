@@ -1,0 +1,136 @@
+--- a/third_party/blink/renderer/core/exported/build.gni
++++ b/third_party/blink/renderer/core/exported/build.gni
+@@ -7,6 +7,7 @@ blink_core_sources_exported = [
+   "web_array_buffer_converter.cc",
+   "web_blob.cc",
+   "web_bundled_code_cache_generator.cc",
++  "web_callisto.cc",
+   "web_console_message.cc",
+   "web_content_holder.cc",
+   "web_custom_element.cc",
+--- /dev/null
++++ b/third_party/blink/renderer/core/exported/web_callisto.cc
+@@ -0,0 +1,123 @@
++#include "third_party/blink/public/web/web_callisto.h"
++
++#include "third_party/blink/renderer/bindings/core/v8/js_based_event_listener.h"
++#include "third_party/blink/renderer/bindings/core/v8/to_v8_traits.h"
++#include "third_party/blink/renderer/bindings/core/v8/v8_event_target.h"
++#include "third_party/blink/renderer/core/dom/events/event_target.h"
++#include "third_party/blink/renderer/core/dom/events/registered_event_listener.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/bindings/script_state.h"
++#include "third_party/blink/renderer/platform/bindings/v8_binding.h"
++
++namespace blink {
++
++WebEventListenerInfo::WebEventListenerInfo() = default;
++WebEventListenerInfo::WebEventListenerInfo(const WebEventListenerInfo&) =
++    default;
++WebEventListenerInfo& WebEventListenerInfo::operator=(
++    const WebEventListenerInfo&) = default;
++WebEventListenerInfo::~WebEventListenerInfo() = default;
++
++namespace {
++
++void CollectEventListenersFromTarget(
++    v8::Isolate* isolate,
++    v8::Local<v8::Context> context,
++    EventTarget* target,
++    std::vector<WebEventListenerInfo>* out_listeners) {
++  if (!target || !target->GetExecutionContext()) {
++    return;
++  }
++
++  ExecutionContext* execution_context = target->GetExecutionContext();
++  Vector<AtomicString> event_types = target->EventTypes();
++
++  for (const AtomicString& type : event_types) {
++    HeapVector<Member<RegisteredEventListener>, 1> listeners;
++    if (auto* registered_listeners = target->GetEventListeners(type)) {
++      listeners = *registered_listeners;
++    } else {
++      continue;
++    }
++
++    for (auto& registered_event_listener : listeners) {
++      if (registered_event_listener->Removed()) {
++        continue;
++      }
++
++      EventListener* event_listener = registered_event_listener->Callback();
++      JSBasedEventListener* js_listener =
++          DynamicTo<JSBasedEventListener>(event_listener);
++      if (!js_listener) {
++        continue;
++      }
++
++      v8::Local<v8::Context> listener_context = ToV8Context(
++          execution_context, js_listener->GetWorldForInspector());
++
++      if (listener_context != context) {
++        continue;
++      }
++
++      v8::Local<v8::Value> handler = js_listener->GetListenerObject(*target);
++      if (handler.IsEmpty() || !handler->IsObject()) {
++        continue;
++      }
++
++      v8::Local<v8::Value> effective_function =
++          js_listener->GetEffectiveFunction(*target);
++      if (!effective_function->IsFunction()) {
++        continue;
++      }
++
++      v8::Local<v8::Function> function = effective_function.As<v8::Function>();
++
++      WebEventListenerInfo info;
++      info.type = WebString(type);
++      info.use_capture = registered_event_listener->Capture();
++      info.passive = registered_event_listener->Passive();
++      info.once = registered_event_listener->Once();
++      info.handler = handler.As<v8::Object>();
++      info.listener = function;
++      info.script_id = function->ScriptId();
++      v8::Location location = function->GetScriptLocation();
++      info.line_number = location.GetLineNumber();
++      info.column_number = location.GetColumnNumber();
++
++      out_listeners->push_back(std::move(info));
++    }
++  }
++}
++
++}  // namespace
++
++std::vector<WebEventListenerInfo> WebCallisto::GetEventListeners(
++    v8::Isolate* isolate,
++    v8::Local<v8::Context> context,
++    v8::Local<v8::Value> object) {
++  std::vector<WebEventListenerInfo> result;
++
++  if (object.IsEmpty() || !object->IsObject()) {
++    return result;
++  }
++
++  EventTarget* target = V8EventTarget::ToWrappable(isolate, object);
++  if (!target) {
++    return result;
++  }
++
++  CollectEventListenersFromTarget(isolate, context, target, &result);
++
++  std::stable_sort(result.begin(), result.end(),
++                   [](const WebEventListenerInfo& a,
++                      const WebEventListenerInfo& b) {
++                     if (a.use_capture != b.use_capture) {
++                       return a.use_capture > b.use_capture;
++                     }
++                     return false;
++                   });
++
++  return result;
++}
++
++}  // namespace blink
