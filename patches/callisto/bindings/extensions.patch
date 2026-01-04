@@ -20,7 +20,7 @@
      "native_extension_bindings_system.cc",
 --- /dev/null
 +++ b/extensions/renderer/callisto_api.cc
-@@ -0,0 +1,1228 @@
+@@ -0,0 +1,1233 @@
 +#include "extensions/renderer/callisto_api.h"
 +
 +#include <cstring>
@@ -433,10 +433,15 @@
 +    prototype = prototype_arg.As<v8::Object>();
 +  }
 +
++  bool skip_gc = false;
++  if (info.Length() >= 2 && info[1]->IsBoolean()) {
++    skip_gc = info[1]->BooleanValue(isolate);
++  }
++
 +  v8::Context::Scope main_context_scope(main_context);
 +
 +  std::vector<v8::Global<v8::Object>> results;
-+  v8::callisto::QueryObjects(main_context, prototype, &results);
++  v8::callisto::QueryObjects(main_context, prototype, &results, skip_gc);
 +
 +  v8::Local<v8::Array> result_array = v8::Array::New(isolate, results.size());
 +  for (size_t i = 0; i < results.size(); ++i) {
